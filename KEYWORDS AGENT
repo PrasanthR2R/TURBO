@@ -2,12 +2,15 @@ function main() {
   // ===== Global Config =====
   var DEBUG = true;
   var OVERWRITE_OUTPUT = true;
-  var WHITELIST_ACCOUNTS = ['360-649-6025', '889-970-5633', '252-158-8925'];
 
-  var MIN_SPEND_45D = 1.00;
+  // Leave empty to run ALL accounts under the MCC.
+  // If you ever want to scope it, drop IDs here: ['123-456-7890', ...]
+  var WHITELIST_ACCOUNTS = [];
+
+  var MIN_SPEND_45D = 1.00;      // spend threshold for "active"
   var MIN_CLICKS = 20;
   var MIN_IMPR = 1000;
-  var LOW_CTR_BP = 300; // 3.00%
+  var LOW_CTR_BP = 300;          // 3.00%
   var MIN_CONV_POS_TERM = 2;
   var HIGH_CTR_POS_TERM_BP = 500; // 5.00%
   var HIGH_CPA_FACTOR = 1.5;
@@ -74,7 +77,11 @@ function main() {
   }
   function buildActiveKeywordIndex() {
     var idx = { byAdGroup: {}, byCampaign: {} };
-    var it = AdsApp.keywords().withCondition("Status = ENABLED").withCondition("CampaignStatus != REMOVED").withCondition("AdGroupStatus != REMOVED").get();
+    var it = AdsApp.keywords()
+      .withCondition("Status = ENABLED")
+      .withCondition("CampaignStatus != REMOVED")
+      .withCondition("AdGroupStatus != REMOVED")
+      .get();
     while (it.hasNext()) {
       var kw = it.next(), agId = String(kw.getAdGroup().getId()), cId = String(kw.getCampaign().getId()), text = stripMatchSyntax(kw.getText());
       if (!idx.byAdGroup[agId]) idx.byAdGroup[agId] = {};
@@ -83,7 +90,7 @@ function main() {
     }
     return idx;
   }
-  // === UPDATED: accepts Date objects and returns basis points ===
+  // === accepts Date objects and returns basis points ===
   function searchBudgetLostISbpForCampaign(camp, startDate, endDate) {
     try {
       if (camp.getAdvertisingChannelType() !== 'SEARCH') return '';
@@ -98,6 +105,29 @@ function main() {
     start.setDate(end.getDate() - (daysBack - 1));
     var tz = AdsApp.currentAccount().getTimeZone();
     return { start: Utilities.formatDate(start, tz, 'yyyyMMdd'), end: Utilities.formatDate(end, tz, 'yyyyMMdd') };
+  }
+
+  // Build campaign eligibility set (ENABLED + spend >= MIN_SPEND_45D)
+  function buildEligibleCampaignSet(dr) {
+    var set = {};
+    var it = AdsApp.campaigns()
+      .withCondition("Status = ENABLED")
+      .get();
+    while (it.hasNext()) {
+      var c = it.next();
+      var cost = c.getStatsFor(dr.start, dr.end).getCost();
+      if (cost >= MIN_SPEND_45D) set[String(c.getId())] = true;
+    }
+    return set;
+  }
+
+  // Helper to get all accounts or a whitelist
+  function getAccountIterator() {
+    var sel = MccApp.accounts();
+    if (WHITELIST_ACCOUNTS && WHITELIST_ACCOUNTS.length) {
+      sel = sel.withIds(WHITELIST_ACCOUNTS);
+    }
+    return sel.get();
   }
 
   // ===== Prepare Output =====
@@ -124,13 +154,21 @@ function main() {
   var dr = getDateRangeLastNDays(DAYS_BACK); // yyyyMMdd strings for selectors/reports
 
   // ===== Process Accounts =====
-  var accIter = MccApp.accounts().withIds(WHITELIST_ACCOUNTS).get();
+  var accIter = getAccountIterator();
   while (accIter.hasNext()) {
     var account = accIter.next(); MccApp.select(account);
     var accId = normalizeId(AdsApp.currentAccount().getCustomerId());
     var runDate = toDateYMD(AdsApp.currentAccount().getTimeZone());
     var dealerName = dealerMap.byAccountId[accId] || '';
-    log('Processing account %s (%s)', accId, dealerName);
+    log('Processing account %s (%s)', accId, dealerName || '—');
+
+    // Determine eligible campaigns (active = ENABLED + >= $1 spend in window)
+    var eligibleCampaigns = buildEligibleCampaignSet(dr);
+    var eligibleCount = Object.keys(eligibleCampaigns).length;
+    if (eligibleCount === 0) {
+      log('Skipping account %s: no ENABLED campaigns with >= $%s in last %s days.', accId, MIN_SPEND_45D.toFixed(2), DAYS_BACK);
+      continue; // not an active dealer by spend rule
+    }
 
     var kwIndex = buildActiveKeywordIndex();
 
@@ -156,6 +194,11 @@ function main() {
       var kw = kwIt.next();
       var ag = kw.getAdGroup();
       var camp = ag.getCampaign();
+      var cIdStr = String(camp.getId());
+
+      // Campaign-level spend filter: only process eligible campaigns
+      if (!eligibleCampaigns[cIdStr]) continue;
+
       var st = kw.getStatsFor(dr.start, dr.end);
 
       var impr = st.getImpressions();
@@ -165,7 +208,7 @@ function main() {
       var cost = st.getCost();
       var cpa = (conv > 0) ? Math.round((cost / conv) * 100) / 100 : ''; // rounded to 2 decimals
 
-      if (cost < MIN_SPEND_45D) continue; // spend guard
+      if (cost < MIN_SPEND_45D) continue; // per-entity spend guard
 
       var reasons = [];
       var suggested = '';
@@ -223,10 +266,13 @@ function main() {
 
     while (rows.hasNext()) {
       var r = rows.next();
+
+      // Campaign-level spend filter: only process eligible campaigns
+      var cIdStr = String(r['CampaignId']);
+      if (!eligibleCampaigns[cIdStr]) continue;
+
       var impr = Number(r['Impressions']);
       var clicks = Number(r['Clicks']);
-      // Removed: parsing r['Ctr'] (string). We recompute from raw metrics instead.
-
       var cost = Number(r['Cost']);
       var conv = Number(r['Conversions']);
       if (cost < MIN_SPEND_45D) continue;
@@ -240,10 +286,10 @@ function main() {
       var ctr_bp_write = (impr > 0) ? Math.round((clicks / impr) * 10000) : 0;
       var cvr_bp_write = (clicks > 0) ? Math.round((conv / clicks) * 10000) : 0;
 
-      // === UPDATED: compute CTR bp for the rule from raw metrics (robust to locales) ===
+      // Recomputed CTR bp for rule (robust to locales)
       var ctrBpForRule = (impr > 0) ? Math.round((clicks / impr) * 10000) : 0;
 
-      // Positive selection (unchanged thresholds, but rule now uses ctrBpForRule)
+      // Positive selection (unchanged thresholds; rule now uses ctrBpForRule)
       if (!existingKeywordMatch && (conv >= MIN_CONV_POS_TERM || (ctrBpForRule >= HIGH_CTR_POS_TERM_BP && clicks >= MIN_CLICKS))) {
         // DEBUG: increment only when CTR branch (not conversions) triggers
         if (conv < MIN_CONV_POS_TERM && (ctrBpForRule >= HIGH_CTR_POS_TERM_BP && clicks >= MIN_CLICKS)) ctrRuleHits++;
