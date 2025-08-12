@@ -7,12 +7,12 @@ function main() {
   var MIN_SPEND_45D = 1.00;
   var MIN_CLICKS = 20;
   var MIN_IMPR = 1000;
-  var LOW_CTR_BP = 300;
+  var LOW_CTR_BP = 300; // 3.00%
   var MIN_CONV_POS_TERM = 2;
-  var HIGH_CTR_POS_TERM_BP = 500;
+  var HIGH_CTR_POS_TERM_BP = 500; // 5.00%
   var HIGH_CPA_FACTOR = 1.5;
 
-  var DAYS_BACK = 45; // Replace LAST_45_DAYS with this many days back
+  var DAYS_BACK = 45; // custom range for 45 days
 
   // ===== Sheet Config =====
   var DEALER_MASTER_SSID = '18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg';
@@ -44,19 +44,13 @@ function main() {
   }
   function appendRows(sh, header, rows) { if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, header.length).setValues(rows); }
   function setPlainTextColumns(sh, header, colNames) {
-    var nameToIndex = {};
-    for (var i = 0; i < header.length; i++) {
-      nameToIndex[header[i]] = i + 1;
-    }
+    var nameToIndex = {}; for (var i = 0; i < header.length; i++) nameToIndex[header[i]] = i + 1;
     if (sh.getLastRow() <= 1) return; // no data beyond header
     colNames.forEach(function (name) {
       var idx = nameToIndex[name];
       if (idx) {
         var numRows = sh.getLastRow() - 1;
-        if (numRows > 0) {
-          var rng = sh.getRange(2, idx, numRows);
-          rng.setNumberFormat('@');
-        }
+        if (numRows > 0) sh.getRange(2, idx, numRows).setNumberFormat('@');
       }
     });
   }
@@ -66,9 +60,9 @@ function main() {
     var sh = ss.getSheetByName(DEALER_MASTER_TAB); if (!sh) return map;
     var data = sh.getDataRange().getValues(); if (data.length < 2) return map;
     var header = data[0].map(function (h) { return String(h).toLowerCase().trim(); });
-    var idxAcc = header.findIndex(h => h.indexOf('account') > -1);
-    var idxDealer = header.findIndex(h => h.indexOf('dealer') > -1);
-    var idxTargetCpa = header.findIndex(h => h.indexOf('target cpa') > -1);
+    var idxAcc = header.findIndex(function(h){ return h.indexOf('account')>-1; });
+    var idxDealer = header.findIndex(function(h){ return h.indexOf('dealer')>-1; });
+    var idxTargetCpa = header.findIndex(function(h){ return h.indexOf('target cpa')>-1; });
     for (var r = 1; r < data.length; r++) {
       var acc = idxAcc >= 0 ? normalizeId(data[r][idxAcc]) : '';
       if (!acc) continue;
@@ -89,25 +83,21 @@ function main() {
     }
     return idx;
   }
-  function searchBudgetLostISbpForCampaign(camp, start, end) {
+  // === UPDATED: accepts Date objects and returns basis points ===
+  function searchBudgetLostISbpForCampaign(camp, startDate, endDate) {
     try {
       if (camp.getAdvertisingChannelType() !== 'SEARCH') return '';
-      var st = camp.getStatsFor(start, end);
-      var val = st.getSearchBudgetLostImpressionShare();
-      return val ? pctToBp(val) : '';
-    } catch (e) {
-      return '';
-    }
+      var st = camp.getStatsFor(startDate, endDate);
+      var v = st.getSearchBudgetLostImpressionShare();
+      return isFinite(v) ? Math.round(v * 10000) : '';
+    } catch (e) { return ''; }
   }
   function getDateRangeLastNDays(daysBack) {
     var end = new Date();
     var start = new Date();
     start.setDate(end.getDate() - (daysBack - 1));
     var tz = AdsApp.currentAccount().getTimeZone();
-    return {
-      start: Utilities.formatDate(start, tz, 'yyyyMMdd'),
-      end: Utilities.formatDate(end, tz, 'yyyyMMdd')
-    };
+    return { start: Utilities.formatDate(start, tz, 'yyyyMMdd'), end: Utilities.formatDate(end, tz, 'yyyyMMdd') };
   }
 
   // ===== Prepare Output =====
@@ -117,71 +107,187 @@ function main() {
   var headerNeg = ['run_date','account_id','dealer_name','campaign_id','campaign_name','ad_group_id','ad_group_name','search_term','impr_45d','clicks_45d','ctr_bp_45d','conv_45d','cvr_bp_45d','cost_45d','reason_flagged','suggested_action','negative_level','eligible_for_push'];
   var headerTop = ['run_date','account_id','dealer_name','campaign_id','campaign_name','ad_group_id','ad_group_name','keyword_id','keyword_text','match_type','impr_45d','clicks_45d','ctr_bp_45d','conv_45d','cvr_bp_45d','cost_45d','cpa_45d','lost_is_budget_bp','reason_flagged','suggested_action','eligible_for_push'];
 
-  var shFlagged = getOrCreateSheet(outSS, TAB_KEYWORDS_FLAGGED), shPos = getOrCreateSheet(outSS, TAB_TERMS_POS), shNeg = getOrCreateSheet(outSS, TAB_TERMS_NEG), shTop = getOrCreateSheet(outSS, TAB_KEYWORDS_TOP);
-  clearAndEnsureHeader(shFlagged, headerFlagged); clearAndEnsureHeader(shPos, headerPos); clearAndEnsureHeader(shNeg, headerNeg); clearAndEnsureHeader(shTop, headerTop);
+  var shFlagged = getOrCreateSheet(outSS, TAB_KEYWORDS_FLAGGED);
+  var shPos = getOrCreateSheet(outSS, TAB_TERMS_POS);
+  var shNeg = getOrCreateSheet(outSS, TAB_TERMS_NEG);
+  var shTop = getOrCreateSheet(outSS, TAB_KEYWORDS_TOP);
+
+  clearAndEnsureHeader(shFlagged, headerFlagged);
+  clearAndEnsureHeader(shPos, headerPos);
+  clearAndEnsureHeader(shNeg, headerNeg);
+  clearAndEnsureHeader(shTop, headerTop);
 
   // ===== Dealer Map =====
   var dealerMap = readDealerMapping();
 
   // ===== Date Range =====
-  var dr = getDateRangeLastNDays(DAYS_BACK);
+  var dr = getDateRangeLastNDays(DAYS_BACK); // yyyyMMdd strings for selectors/reports
 
   // ===== Process Accounts =====
   var accIter = MccApp.accounts().withIds(WHITELIST_ACCOUNTS).get();
   while (accIter.hasNext()) {
     var account = accIter.next(); MccApp.select(account);
-    var accId = normalizeId(AdsApp.currentAccount().getCustomerId()), runDate = toDateYMD(AdsApp.currentAccount().getTimeZone()), dealerName = dealerMap.byAccountId[accId] || '';
+    var accId = normalizeId(AdsApp.currentAccount().getCustomerId());
+    var runDate = toDateYMD(AdsApp.currentAccount().getTimeZone());
+    var dealerName = dealerMap.byAccountId[accId] || '';
     log('Processing account %s (%s)', accId, dealerName);
+
     var kwIndex = buildActiveKeywordIndex();
+
+    // === Build Date objects once per account for lost IS ===
+    var end45 = new Date();
+    end45.setDate(end45.getDate() - 1);
+    end45.setHours(23,59,59,999);
+    var start45 = new Date(end45);
+    start45.setDate(start45.getDate() - 44);
+    start45.setHours(0,0,0,0);
 
     var rowsFlagged = [], rowsTop = [], rowsPos = [], rowsNeg = [];
 
-    // ---- Keywords ----
-    var kwIt = AdsApp.keywords().withCondition("CampaignStatus != REMOVED").withCondition("AdGroupStatus != REMOVED").withCondition("Status != REMOVED").forDateRange(dr.start, dr.end).get();
+    // ---- Keywords (Flagged + Top) ----
+    var kwIt = AdsApp.keywords()
+      .withCondition("CampaignStatus != REMOVED")
+      .withCondition("AdGroupStatus != REMOVED")
+      .withCondition("Status != REMOVED")
+      .forDateRange(dr.start, dr.end)
+      .get();
+
     while (kwIt.hasNext()) {
-      var kw = kwIt.next(), ag = kw.getAdGroup(), camp = ag.getCampaign(), st = kw.getStatsFor(dr.start, dr.end);
-      var impr = st.getImpressions(), clicks = st.getClicks(), ctr_bp = pctToBp(st.getCtr()), conv = st.getConversions(), cvr_bp = pctToBp(st.getConversionRate()), cost = st.getCost(), cpa = conv > 0 ? cost / conv : '';
-      if (cost < MIN_SPEND_45D) continue;
-      var reasons = [], suggested = '', targetCpa = dealerMap.cpaByAccountId[accId], lostISbp = searchBudgetLostISbpForCampaign(camp, dr.start, dr.end);
+      var kw = kwIt.next();
+      var ag = kw.getAdGroup();
+      var camp = ag.getCampaign();
+      var st = kw.getStatsFor(dr.start, dr.end);
+
+      var impr = st.getImpressions();
+      var clicks = st.getClicks();
+      var ctr_bp = pctToBp(st.getCtr());
+      var conv = st.getConversions();
+      var cost = st.getCost();
+      var cpa = (conv > 0) ? Math.round((cost / conv) * 100) / 100 : ''; // rounded to 2 decimals
+
+      if (cost < MIN_SPEND_45D) continue; // spend guard
+
+      var reasons = [];
+      var suggested = '';
+      var targetCpa = dealerMap.cpaByAccountId[accId];
+      var lostISbp = searchBudgetLostISbpForCampaign(camp, start45, end45); // Date objects
+
+      // Flagging rules (unchanged)
       if (conv === 0 && (clicks >= MIN_CLICKS || cost >= 25) && impr > 0) { reasons.push('NO_CONV'); suggested = 'pause_keyword'; }
       if ((impr === 0 || clicks === 0) && cost >= MIN_SPEND_45D) { reasons.push('LOW_SERVE'); if (!suggested) suggested = 'check_bid_or_pause'; }
       if (ctr_bp !== '' && ctr_bp < LOW_CTR_BP && impr >= MIN_IMPR) { reasons.push('LOW_CTR'); if (!suggested) suggested = 'pause_keyword'; }
       if (targetCpa && conv >= 5 && cpa !== '' && cpa >= targetCpa * HIGH_CPA_FACTOR) { reasons.push('HIGH_CPA'); if (!suggested) suggested = 'lower_bid'; }
-      if (reasons.length > 0) rowsFlagged.push([runDate, accId, dealerName, String(camp.getId()), camp.getName(), String(ag.getId()), ag.getName(), String(kw.getId()), kw.getText(), kw.getMatchType(), impr, clicks, ctr_bp, conv, cvr_bp, cost, cpa, lostISbp, reasons.join('|'), suggested, kw.isEnabled()]);
+
+      if (reasons.length > 0) {
+        var cvr_bp_flagged = (clicks > 0) ? Math.round((conv / clicks) * 10000) : 0; // derived write
+        rowsFlagged.push([
+          runDate, accId, dealerName,
+          String(camp.getId()), camp.getName(),
+          String(ag.getId()), ag.getName(),
+          String(kw.getId()), kw.getText(), kw.getMatchType(),
+          impr, clicks, ctr_bp, conv, cvr_bp_flagged,
+          cost, cpa, lostISbp,
+          reasons.join('|'),
+          suggested,
+          kw.isEnabled()
+        ]);
+      }
+
+      // Top selection (unchanged rules). Write derived CVR bp per requirement.
       if ((conv >= 5) && (targetCpa ? (cpa !== '' && cpa <= targetCpa) : (ctr_bp >= 300))) {
         var topReason = (camp.getAdvertisingChannelType() === 'SEARCH' && lostISbp >= 1000) ? 'BUDGET_HEADROOM' : 'GOOD_PERF';
-        rowsTop.push([runDate, accId, dealerName, String(camp.getId()), camp.getName(), String(ag.getId()), ag.getName(), String(kw.getId()), kw.getText(), kw.getMatchType(), impr, clicks, ctr_bp, conv, cvr_bp, cost, cpa, camp.getAdvertisingChannelType() === 'SEARCH' ? lostISbp : '', topReason, 'increase_bid_or_budget', kw.isEnabled()]);
+        var cvr_bp_top = (clicks > 0) ? Math.round((conv / clicks) * 10000) : 0; // derived write
+        rowsTop.push([
+          runDate, accId, dealerName,
+          String(camp.getId()), camp.getName(),
+          String(ag.getId()), ag.getName(),
+          String(kw.getId()), kw.getText(), kw.getMatchType(),
+          impr, clicks, ctr_bp, conv, cvr_bp_top,
+          cost, cpa,
+          (camp.getAdvertisingChannelType() === 'SEARCH' ? (lostISbp || '') : ''),
+          topReason, 'increase_bid_or_budget', kw.isEnabled()
+        ]);
       }
     }
 
-    // ---- Search Terms ----
+    // ---- Search Terms (Positive + Negative) ----
     var report = AdsApp.report([
       'SELECT Query, CampaignId, CampaignName, AdGroupId, AdGroupName, Impressions, Clicks, Ctr, Cost, Conversions, ConversionRate',
       'FROM SEARCH_QUERY_PERFORMANCE_REPORT',
       'WHERE CampaignStatus != "REMOVED" AND AdGroupStatus != "REMOVED"',
       'DURING ' + dr.start + ',' + dr.end
     ].join(' '));
+
     var rows = report.rows();
+    var ctrRuleHits = 0; // DEBUG: count CTR-branch positives
+
     while (rows.hasNext()) {
       var r = rows.next();
-      var impr = Number(r['Impressions']), clicks = Number(r['Clicks']), ctr_bp = pctToBp(Number(r['Ctr'])), cost = Number(r['Cost']), conv = Number(r['Conversions']), cvr_bp = pctToBp(Number(r['ConversionRate']));
+      var impr = Number(r['Impressions']);
+      var clicks = Number(r['Clicks']);
+      // Removed: parsing r['Ctr'] (string). We recompute from raw metrics instead.
+
+      var cost = Number(r['Cost']);
+      var conv = Number(r['Conversions']);
       if (cost < MIN_SPEND_45D) continue;
-      var normTerm = stripMatchSyntax(r['Query']), existsInAdGroup = kwIndex.byAdGroup[r['AdGroupId']] && kwIndex.byAdGroup[r['AdGroupId']][normTerm], existsInCampaign = kwIndex.byCampaign[r['CampaignId']] && kwIndex.byCampaign[r['CampaignId']][normTerm], existingKeywordMatch = !!(existsInAdGroup || existsInCampaign);
-      if (!existingKeywordMatch && (conv >= MIN_CONV_POS_TERM || (ctr_bp >= HIGH_CTR_POS_TERM_BP && clicks >= MIN_CLICKS))) rowsPos.push([runDate, accId, dealerName, r['CampaignId'], r['CampaignName'], r['AdGroupId'], r['AdGroupName'], r['Query'], impr, clicks, ctr_bp, conv, cvr_bp, cost, 'GOOD_TERM', 'add_keyword', true, existingKeywordMatch]);
+
+      var normTerm = stripMatchSyntax(r['Query']);
+      var existsInAdGroup = kwIndex.byAdGroup[r['AdGroupId']] && kwIndex.byAdGroup[r['AdGroupId']][normTerm];
+      var existsInCampaign = kwIndex.byCampaign[r['CampaignId']] && kwIndex.byCampaign[r['CampaignId']][normTerm];
+      var existingKeywordMatch = !!(existsInAdGroup || existsInCampaign);
+
+      // Derived metrics for writing
+      var ctr_bp_write = (impr > 0) ? Math.round((clicks / impr) * 10000) : 0;
+      var cvr_bp_write = (clicks > 0) ? Math.round((conv / clicks) * 10000) : 0;
+
+      // === UPDATED: compute CTR bp for the rule from raw metrics (robust to locales) ===
+      var ctrBpForRule = (impr > 0) ? Math.round((clicks / impr) * 10000) : 0;
+
+      // Positive selection (unchanged thresholds, but rule now uses ctrBpForRule)
+      if (!existingKeywordMatch && (conv >= MIN_CONV_POS_TERM || (ctrBpForRule >= HIGH_CTR_POS_TERM_BP && clicks >= MIN_CLICKS))) {
+        // DEBUG: increment only when CTR branch (not conversions) triggers
+        if (conv < MIN_CONV_POS_TERM && (ctrBpForRule >= HIGH_CTR_POS_TERM_BP && clicks >= MIN_CLICKS)) ctrRuleHits++;
+
+        rowsPos.push([
+          runDate, accId, dealerName,
+          r['CampaignId'], r['CampaignName'],
+          r['AdGroupId'], r['AdGroupName'],
+          r['Query'],
+          impr, clicks, ctr_bp_write, conv, cvr_bp_write, cost,
+          'GOOD_TERM', 'add_keyword', true, existingKeywordMatch
+        ]);
+      }
+
+      // Negative selection (unchanged); write metrics for completeness
       if (!existingKeywordMatch && conv === 0 && (clicks >= MIN_CLICKS || cost >= 25)) {
         var reason = 'WASTE';
         if (/free|cheap|jobs|manual|used parts only|pdf/i.test(normTerm)) reason += '|STOPWORD';
-        rowsNeg.push([runDate, accId, dealerName, r['CampaignId'], r['CampaignName'], r['AdGroupId'], r['AdGroupName'], r['Query'], impr, clicks, ctr_bp, conv, cvr_bp, cost, reason, 'add_negative', 'campaign', true]);
+        var cvr_bp_neg = (clicks > 0) ? Math.round((conv / clicks) * 10000) : 0;
+        var ctr_bp_neg = (impr > 0) ? Math.round((clicks / impr) * 10000) : 0;
+        rowsNeg.push([
+          runDate, accId, dealerName,
+          r['CampaignId'], r['CampaignName'],
+          r['AdGroupId'], r['AdGroupName'],
+          r['Query'],
+          impr, clicks, ctr_bp_neg, conv, cvr_bp_neg, cost,
+          reason, 'add_negative', 'campaign', true
+        ]);
       }
     }
 
+    // DEBUG: log how many positives were triggered by CTR-only branch
+    log('CTR-rule positives: %s', ctrRuleHits);
+
+    // ---- Write rows ----
     appendRows(shFlagged, headerFlagged, rowsFlagged);
     appendRows(shTop, headerTop, rowsTop);
     appendRows(shPos, headerPos, rowsPos);
     appendRows(shNeg, headerNeg, rowsNeg);
+
+    // Plain text for ID columns on all tabs as required (including terms tabs)
+    setPlainTextColumns(shFlagged, headerFlagged, ['account_id','campaign_id','ad_group_id','keyword_id']);
+    setPlainTextColumns(shTop, headerTop, ['account_id','campaign_id','ad_group_id','keyword_id']);
+    setPlainTextColumns(shPos, headerPos, ['account_id','campaign_id','ad_group_id']);
+    setPlainTextColumns(shNeg, headerNeg, ['account_id','campaign_id','ad_group_id']);
   }
-
-  setPlainTextColumns(shFlagged, headerFlagged, ['account_id','campaign_id','ad_group_id','keyword_id']);
-  setPlainTextColumns(shTop, headerTop, ['account_id','campaign_id','ad_group_id','keyword_id']);
 }
-
