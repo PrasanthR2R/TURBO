@@ -1,0 +1,250 @@
+function main() {
+  const DEBUG = true;
+  const OVERWRITE_OUTPUT = true;
+  const WHITELIST_ACCOUNTS = ['360-649-6025', '889-970-5633', '252-158-8925'];
+  const BUDGETS_SPREADSHEET_ID = '18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg';
+  const BUDGETS_TAB_NAME = 'Dealer Master';
+  const OUTPUT_SPREADSHEET_ID = '1VjU6Rs_44TeXtyXmLJriA9TosTcgA_H3bCT7-ZXk-F4';
+  const OUTPUT_TAB_NAME = 'PACING';
+  const PACE_BAND_BP = 500;
+  const FLUSH_EVERY_N_ROWS = 25;
+  const CATEGORY_KEYWORDS = {
+    'Remarketing': /remarketing/i,
+    'Co-Op': /co-?op|coop/i,
+    'YouTube': /youtube|yt|video/i
+  };
+
+  const tz = AdsApp.currentAccount().getTimeZone();
+  const today = new Date();
+  const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+  const start45 = new Date(yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate() - 44);
+
+  const start45Str = formatDateYMD_(start45);
+  const end45Str = formatDateYMD_(yesterday);
+
+  const budgetsMap = getBudgetsMap_(BUDGETS_SPREADSHEET_ID, BUDGETS_TAB_NAME);
+  const outSS = SpreadsheetApp.openById(OUTPUT_SPREADSHEET_ID);
+  const sheet = outSS.getSheetByName(OUTPUT_TAB_NAME) || outSS.insertSheet(OUTPUT_TAB_NAME);
+  if (OVERWRITE_OUTPUT) sheet.clearContents();
+  const headers = [
+    'run_date','row_type','account_id','dealer_name','category','campaign_id','campaign_name','budget_source','shared_budget_id',
+    'current_daily_budget','monthly_budget','mtd_spend','avg_daily_last7','remaining_days','needed_daily','gap_bp','pacing_status',
+    'impr_45d','clicks_45d','ctr_bp_45d','conv_45d','cvr_bp_45d','cost_45d','lost_is_budget_bp','limited_by_budget_flag',
+    'top_campaigns_json','eligible_for_push','notes'
+  ];
+  if (sheet.getLastRow() === 0) sheet.appendRow(headers);
+
+  let totalRows = sheet.getLastRow();
+
+  const accIter = AdsManagerApp.accounts().withIds(WHITELIST_ACCOUNTS).get();
+  while (accIter.hasNext()) {
+    const acc = accIter.next();
+    AdsManagerApp.select(acc);
+    const accIdStr = acc.getCustomerId().replace(/-/g, '');
+    const dealerName = budgetsMap[accIdStr] ? budgetsMap[accIdStr].dealer : '';
+    const remainingDays = daysRemainingInMonth_(today);
+    let campSeen = 0, campWritten = 0, catWritten = 0;
+    let categoryData = {};
+
+    const campaigns = getAllCampaigns_();
+    while (campaigns.hasNext()) {
+      const c = campaigns.next(); campSeen++;
+      const cname = c.getName();
+      const cat = classify_(c, cname, CATEGORY_KEYWORDS);
+      const binfo = getBudgetInfo_(c);
+      const mtdStats = c.getStatsFor('THIS_MONTH');
+      const last7Stats = c.getStatsFor('LAST_7_DAYS');
+      const stats45 = c.getStatsFor(start45Str, end45Str);
+
+      const mtdSpend = mtdStats.getCost();
+      const avg7 = last7Stats.getCost() / 7;
+      const impr45 = stats45.getImpressions();
+      const clicks45 = stats45.getClicks();
+      const conv45 = stats45.getConversions();
+      const cost45 = stats45.getCost();
+      const ctrBp45 = clicks45 && impr45 ? Math.round((clicks45 / impr45) * 10000) : 0;
+      const cvrBp45 = clicks45 ? Math.round((conv45 / clicks45) * 10000) : 0;
+      const lostISBp = getLostISBudgetBp_(c);
+      const limitedFlag = lostISBp > 0;
+      const eligible = c.isEnabled();
+
+      if (!categoryData[cat]) {
+        categoryData[cat] = {
+          mtd_spend: 0,
+          avg_daily_last7: 0,
+          monthly_budget: budgetsMap[accIdStr] ? budgetsMap[accIdStr][cat] : 0,
+          impr_45d: 0,
+          clicks_45d: 0,
+          conv_45d: 0,
+          cost_45d: 0,
+          lost_is_budget_bp: 0,
+          limited_flag: false,
+          top_campaigns: [],
+          sharedBudgetSeen: {},
+          daily_budget: 0
+        };
+      }
+      const cd = categoryData[cat];
+      cd.mtd_spend += mtdSpend;
+      cd.avg_daily_last7 += avg7;
+      cd.impr_45d += impr45;
+      cd.clicks_45d += clicks45;
+      cd.conv_45d += conv45;
+      cd.cost_45d += cost45;
+      cd.lost_is_budget_bp = Math.max(cd.lost_is_budget_bp, lostISBp);
+      cd.limited_flag = cd.limited_flag || limitedFlag;
+      if (binfo.source === 'shared') {
+        if (!cd.sharedBudgetSeen[binfo.sharedBudgetId]) {
+          cd.daily_budget += binfo.amount;
+          cd.sharedBudgetSeen[binfo.sharedBudgetId] = true;
+        }
+      } else {
+        cd.daily_budget += binfo.amount;
+      }
+      cd.top_campaigns.push({
+        campaign_id: String(c.getId()),
+        campaign_name: cname,
+        impr_45d: impr45,
+        clicks_45d: clicks45,
+        ctr_bp_45d: ctrBp45,
+        conv_45d: conv45,
+        cvr_bp_45d: cvrBp45,
+        cost_45d: cost45,
+        lost_is_budget_bp: lostISBp,
+        limited_by_budget_flag: limitedFlag,
+        current_daily_budget: binfo.amount
+      });
+
+      sheet.appendRow([
+        formatDate_(today, tz),'CAMPAIGN',String(accIdStr),dealerName,cat,String(c.getId()),cname,binfo.source,binfo.sharedBudgetId,
+        binfo.amount,'',mtdSpend,avg7,'','','','','',impr45,clicks45,ctrBp45,conv45,cvrBp45,cost45,lostISBp,limitedFlag,
+        '',eligible,''
+      ]);
+      campWritten++; totalRows++;
+      if (totalRows % FLUSH_EVERY_N_ROWS === 0) SpreadsheetApp.flush();
+    }
+
+    for (let cat in categoryData) {
+      const cd = categoryData[cat];
+      const neededDaily = Math.max(0, (cd.monthly_budget - cd.mtd_spend) / Math.max(1, remainingDays));
+      const forecastEom = cd.mtd_spend + (cd.avg_daily_last7 * remainingDays);
+      let gapBp = 0;
+      if (cd.monthly_budget > 0) gapBp = Math.round(((cd.monthly_budget - forecastEom) / cd.monthly_budget) * 10000);
+      let pacing = 'On';
+      if (gapBp > PACE_BAND_BP) pacing = 'Under';
+      else if (gapBp < -PACE_BAND_BP) pacing = 'Over';
+      cd.top_campaigns.sort((a,b)=> b.conv_45d - a.conv_45d || b.clicks_45d - a.clicks_45d);
+      const top3 = cd.top_campaigns.slice(0,3);
+      const topJson = JSON.stringify(top3);
+
+      sheet.appendRow([
+        formatDate_(today, tz),'CATEGORY',String(accIdStr),dealerName,cat,'','','','',
+        cd.daily_budget,cd.monthly_budget,cd.mtd_spend,'',remainingDays,neededDaily,gapBp,pacing,
+        cd.impr_45d,cd.clicks_45d,cd.clicks_45d && cd.impr_45d ? Math.round((cd.clicks_45d / cd.impr_45d) * 10000) : 0,
+        cd.conv_45d,cd.clicks_45d ? Math.round((cd.conv_45d / cd.clicks_45d) * 10000) : 0,cd.cost_45d,
+        cd.lost_is_budget_bp,cd.limited_flag,topJson,'',''
+      ]);
+      catWritten++; totalRows++;
+      if (totalRows % FLUSH_EVERY_N_ROWS === 0) SpreadsheetApp.flush();
+    }
+
+    if (DEBUG) Logger.log('%s %s | seen:%s campRows:%s catRows:%s sampleMTD:%s last7:%s clicks45:%s',
+      accIdStr,dealerName,campSeen,campWritten,catWritten,
+      Object.values(categoryData)[0]?.mtd_spend||0,
+      Object.values(categoryData)[0]?.avg_daily_last7||0,
+      Object.values(categoryData)[0]?.clicks_45d||0
+    );
+  }
+  SpreadsheetApp.flush();
+  if (DEBUG) Logger.log('Total rows written: %s', totalRows);
+}
+
+function formatDateYMD_(d) {
+  return Utilities.formatDate(d, AdsApp.currentAccount().getTimeZone(), 'yyyyMMdd');
+}
+
+function getBudgetsMap_(id, tab) {
+  const map = {};
+  const ss = SpreadsheetApp.openById(id);
+  const sh = ss.getSheetByName(tab);
+  const data = sh.getDataRange().getValues();
+  const head = data[0].map(h=> String(h).trim().toLowerCase());
+  const idxId = head.indexOf('google account id');
+  const idxDealer = head.indexOf('dealer name');
+  const idxReg = head.indexOf('regular');
+  const idxRm = head.indexOf('remarketing');
+  const idxYT = head.indexOf('youtube');
+  const idxCo = head.indexOf('co-op') >=0 ? head.indexOf('co-op') : head.indexOf('coop');
+  for (let i=1;i<data.length;i++) {
+    const row = data[i];
+    const accId = String(row[idxId]||'').replace(/-/g,'');
+    if (!accId) continue;
+    map[accId] = {
+      dealer: row[idxDealer] || '',
+      'Regular': parseFloat(row[idxReg])||0,
+      'Remarketing': parseFloat(row[idxRm])||0,
+      'YouTube': parseFloat(row[idxYT])||0,
+      'Co-Op': parseFloat(row[idxCo])||0
+    };
+  }
+  return map;
+}
+
+function classify_(c, name, kw) {
+  if (kw['Remarketing'].test(name)) return 'Remarketing';
+  if (kw['Co-Op'].test(name)) return 'Co-Op';
+  const type = (typeof c.getType === 'function') ? String(c.getType()) : '';
+  if (kw['YouTube'].test(name) || /video/i.test(type)) return 'YouTube';
+  return 'Regular';
+}
+
+function getAllCampaigns_() {
+  const iters = [
+    AdsApp.campaigns().get(),
+    AdsApp.videoCampaigns().get(),
+    AdsApp.performanceMaxCampaigns().get(),
+    AdsApp.shoppingCampaigns().get()
+  ];
+  return {
+    _iters: iters,
+    _cur: null,
+    hasNext: function() {
+      while (this._cur === null || !this._cur.hasNext()) {
+        if (!this._iters.length) return false;
+        this._cur = this._iters.shift();
+      }
+      return true;
+    },
+    next: function() { return this._cur.next(); }
+  };
+}
+
+function getBudgetInfo_(c) {
+  let source = 'individual', sharedId = '', amt = 0;
+  try {
+    const b = c.getBudget();
+    amt = b.getAmount();
+    if (typeof b.isExplicitlyShared === 'function' && b.isExplicitlyShared()) {
+      source = 'shared'; sharedId = String(b.getId());
+    }
+  } catch(e){}
+  return {source:source,sharedBudgetId:sharedId,amount:amt};
+}
+
+function getLostISBudgetBp_(c) {
+  try {
+    if (typeof c.getStatsFor('THIS_MONTH').getSearchBudgetLostImpressionShare === 'function') {
+      const val = c.getStatsFor('THIS_MONTH').getSearchBudgetLostImpressionShare();
+      if (isFinite(val)) return Math.round(val*10000);
+    }
+  } catch(e){}
+  return 0;
+}
+
+function daysRemainingInMonth_(d) {
+  return new Date(d.getFullYear(), d.getMonth()+1, 0).getDate() - d.getDate();
+}
+
+function formatDate_(d, tz) {
+  return Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+}
