@@ -1,7 +1,6 @@
 function main() {
   const DEBUG = true;
   const OVERWRITE_OUTPUT = true;
-  const WHITELIST_ACCOUNTS = ['360-649-6025', '889-970-5633', '252-158-8925'];
   const BUDGETS_SPREADSHEET_ID = '18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg';
   const BUDGETS_TAB_NAME = 'Dealer Master';
   const OUTPUT_SPREADSHEET_ID = '1VjU6Rs_44TeXtyXmLJriA9TosTcgA_H3bCT7-ZXk-F4';
@@ -52,7 +51,8 @@ function main() {
 
   let totalRows = sheet.getLastRow();
 
-  const accIter = AdsManagerApp.accounts().withIds(WHITELIST_ACCOUNTS).get();
+  // Iterate ALL linked client accounts under this MCC
+  const accIter = AdsManagerApp.accounts().get();
   while (accIter.hasNext()) {
     const acc = accIter.next();
     AdsManagerApp.select(acc);
@@ -69,7 +69,7 @@ function main() {
       const c = campaigns.next();
       campSeen++;
 
-      // Show only campaigns that spent > $1 yesterday
+      // Only include campaigns that spent > $1 yesterday
       const yesterdaySpend = c.getStatsFor(yesterdayStr, yesterdayStr).getCost();
       if (yesterdaySpend <= 1) continue;
 
