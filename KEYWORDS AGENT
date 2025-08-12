@@ -1,0 +1,187 @@
+function main() {
+  // ===== Global Config =====
+  var DEBUG = true;
+  var OVERWRITE_OUTPUT = true;
+  var WHITELIST_ACCOUNTS = ['360-649-6025', '889-970-5633', '252-158-8925'];
+
+  var MIN_SPEND_45D = 1.00;
+  var MIN_CLICKS = 20;
+  var MIN_IMPR = 1000;
+  var LOW_CTR_BP = 300;
+  var MIN_CONV_POS_TERM = 2;
+  var HIGH_CTR_POS_TERM_BP = 500;
+  var HIGH_CPA_FACTOR = 1.5;
+
+  var DAYS_BACK = 45; // Replace LAST_45_DAYS with this many days back
+
+  // ===== Sheet Config =====
+  var DEALER_MASTER_SSID = '18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg';
+  var DEALER_MASTER_TAB = 'Dealer Master';
+  var OUTPUT_SSID = '1VjU6Rs_44TeXtyXmLJriA9TosTcgA_H3bCT7-ZXk-F4';
+
+  var TAB_KEYWORDS_FLAGGED = 'Keywords_Flagged';
+  var TAB_TERMS_POS = 'SearchTerms_Positive';
+  var TAB_TERMS_NEG = 'SearchTerms_Negative';
+  var TAB_KEYWORDS_TOP = 'Keywords_Top';
+
+  // ===== Helpers =====
+  function log() { if (DEBUG) Logger.log.apply(Logger, arguments); }
+  function normalizeId(id) { return String(id).replace(/\D/g, ''); }
+  function pctToBp(v) {
+    if (v === null || v === undefined || isNaN(v)) return '';
+    var n = Number(v);
+    return Math.round(n <= 1 ? n * 10000 : n * 100);
+  }
+  function toDateYMD(tz) { return Utilities.formatDate(new Date(), tz || AdsApp.currentAccount().getTimeZone(), 'yyyy-MM-dd'); }
+  function stripMatchSyntax(s) {
+    if (s == null) return '';
+    return String(s).toLowerCase().trim().replace(/^[\[\"]+|[\]\"]+$/g, '').replace(/\s+/g, ' ').trim();
+  }
+  function getOrCreateSheet(ss, name) { var sh = ss.getSheetByName(name); if (!sh) sh = ss.insertSheet(name); return sh; }
+  function clearAndEnsureHeader(sh, header) {
+    if (OVERWRITE_OUTPUT) { sh.clear(); sh.clearFormats(); }
+    if (OVERWRITE_OUTPUT || sh.getLastRow() < 1) sh.getRange(1, 1, 1, header.length).setValues([header]);
+  }
+  function appendRows(sh, header, rows) { if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, header.length).setValues(rows); }
+  function setPlainTextColumns(sh, header, colNames) {
+    var nameToIndex = {};
+    for (var i = 0; i < header.length; i++) {
+      nameToIndex[header[i]] = i + 1;
+    }
+    if (sh.getLastRow() <= 1) return; // no data beyond header
+    colNames.forEach(function (name) {
+      var idx = nameToIndex[name];
+      if (idx) {
+        var numRows = sh.getLastRow() - 1;
+        if (numRows > 0) {
+          var rng = sh.getRange(2, idx, numRows);
+          rng.setNumberFormat('@');
+        }
+      }
+    });
+  }
+  function readDealerMapping() {
+    var map = { byAccountId: {}, cpaByAccountId: {} };
+    var ss = SpreadsheetApp.openById(DEALER_MASTER_SSID);
+    var sh = ss.getSheetByName(DEALER_MASTER_TAB); if (!sh) return map;
+    var data = sh.getDataRange().getValues(); if (data.length < 2) return map;
+    var header = data[0].map(function (h) { return String(h).toLowerCase().trim(); });
+    var idxAcc = header.findIndex(h => h.indexOf('account') > -1);
+    var idxDealer = header.findIndex(h => h.indexOf('dealer') > -1);
+    var idxTargetCpa = header.findIndex(h => h.indexOf('target cpa') > -1);
+    for (var r = 1; r < data.length; r++) {
+      var acc = idxAcc >= 0 ? normalizeId(data[r][idxAcc]) : '';
+      if (!acc) continue;
+      var dealer = idxDealer >= 0 ? String(data[r][idxDealer]).trim() : '';
+      if (dealer) map.byAccountId[acc] = dealer;
+      if (idxTargetCpa >= 0 && !isNaN(data[r][idxTargetCpa])) map.cpaByAccountId[acc] = Number(data[r][idxTargetCpa]);
+    }
+    return map;
+  }
+  function buildActiveKeywordIndex() {
+    var idx = { byAdGroup: {}, byCampaign: {} };
+    var it = AdsApp.keywords().withCondition("Status = ENABLED").withCondition("CampaignStatus != REMOVED").withCondition("AdGroupStatus != REMOVED").get();
+    while (it.hasNext()) {
+      var kw = it.next(), agId = String(kw.getAdGroup().getId()), cId = String(kw.getCampaign().getId()), text = stripMatchSyntax(kw.getText());
+      if (!idx.byAdGroup[agId]) idx.byAdGroup[agId] = {};
+      if (!idx.byCampaign[cId]) idx.byCampaign[cId] = {};
+      idx.byAdGroup[agId][text] = true; idx.byCampaign[cId][text] = true;
+    }
+    return idx;
+  }
+  function searchBudgetLostISbpForCampaign(camp, start, end) {
+    try {
+      if (camp.getAdvertisingChannelType() !== 'SEARCH') return '';
+      var st = camp.getStatsFor(start, end);
+      var val = st.getSearchBudgetLostImpressionShare();
+      return val ? pctToBp(val) : '';
+    } catch (e) {
+      return '';
+    }
+  }
+  function getDateRangeLastNDays(daysBack) {
+    var end = new Date();
+    var start = new Date();
+    start.setDate(end.getDate() - (daysBack - 1));
+    var tz = AdsApp.currentAccount().getTimeZone();
+    return {
+      start: Utilities.formatDate(start, tz, 'yyyyMMdd'),
+      end: Utilities.formatDate(end, tz, 'yyyyMMdd')
+    };
+  }
+
+  // ===== Prepare Output =====
+  var outSS = SpreadsheetApp.openById(OUTPUT_SSID);
+  var headerFlagged = ['run_date','account_id','dealer_name','campaign_id','campaign_name','ad_group_id','ad_group_name','keyword_id','keyword_text','match_type','impr_45d','clicks_45d','ctr_bp_45d','conv_45d','cvr_bp_45d','cost_45d','cpa_45d','lost_is_budget_bp','reason_flagged','suggested_action','eligible_for_push'];
+  var headerPos = ['run_date','account_id','dealer_name','campaign_id','campaign_name','ad_group_id','ad_group_name','search_term','impr_45d','clicks_45d','ctr_bp_45d','conv_45d','cvr_bp_45d','cost_45d','reason_flagged','suggested_action','eligible_for_push','existing_keyword_match'];
+  var headerNeg = ['run_date','account_id','dealer_name','campaign_id','campaign_name','ad_group_id','ad_group_name','search_term','impr_45d','clicks_45d','ctr_bp_45d','conv_45d','cvr_bp_45d','cost_45d','reason_flagged','suggested_action','negative_level','eligible_for_push'];
+  var headerTop = ['run_date','account_id','dealer_name','campaign_id','campaign_name','ad_group_id','ad_group_name','keyword_id','keyword_text','match_type','impr_45d','clicks_45d','ctr_bp_45d','conv_45d','cvr_bp_45d','cost_45d','cpa_45d','lost_is_budget_bp','reason_flagged','suggested_action','eligible_for_push'];
+
+  var shFlagged = getOrCreateSheet(outSS, TAB_KEYWORDS_FLAGGED), shPos = getOrCreateSheet(outSS, TAB_TERMS_POS), shNeg = getOrCreateSheet(outSS, TAB_TERMS_NEG), shTop = getOrCreateSheet(outSS, TAB_KEYWORDS_TOP);
+  clearAndEnsureHeader(shFlagged, headerFlagged); clearAndEnsureHeader(shPos, headerPos); clearAndEnsureHeader(shNeg, headerNeg); clearAndEnsureHeader(shTop, headerTop);
+
+  // ===== Dealer Map =====
+  var dealerMap = readDealerMapping();
+
+  // ===== Date Range =====
+  var dr = getDateRangeLastNDays(DAYS_BACK);
+
+  // ===== Process Accounts =====
+  var accIter = MccApp.accounts().withIds(WHITELIST_ACCOUNTS).get();
+  while (accIter.hasNext()) {
+    var account = accIter.next(); MccApp.select(account);
+    var accId = normalizeId(AdsApp.currentAccount().getCustomerId()), runDate = toDateYMD(AdsApp.currentAccount().getTimeZone()), dealerName = dealerMap.byAccountId[accId] || '';
+    log('Processing account %s (%s)', accId, dealerName);
+    var kwIndex = buildActiveKeywordIndex();
+
+    var rowsFlagged = [], rowsTop = [], rowsPos = [], rowsNeg = [];
+
+    // ---- Keywords ----
+    var kwIt = AdsApp.keywords().withCondition("CampaignStatus != REMOVED").withCondition("AdGroupStatus != REMOVED").withCondition("Status != REMOVED").forDateRange(dr.start, dr.end).get();
+    while (kwIt.hasNext()) {
+      var kw = kwIt.next(), ag = kw.getAdGroup(), camp = ag.getCampaign(), st = kw.getStatsFor(dr.start, dr.end);
+      var impr = st.getImpressions(), clicks = st.getClicks(), ctr_bp = pctToBp(st.getCtr()), conv = st.getConversions(), cvr_bp = pctToBp(st.getConversionRate()), cost = st.getCost(), cpa = conv > 0 ? cost / conv : '';
+      if (cost < MIN_SPEND_45D) continue;
+      var reasons = [], suggested = '', targetCpa = dealerMap.cpaByAccountId[accId], lostISbp = searchBudgetLostISbpForCampaign(camp, dr.start, dr.end);
+      if (conv === 0 && (clicks >= MIN_CLICKS || cost >= 25) && impr > 0) { reasons.push('NO_CONV'); suggested = 'pause_keyword'; }
+      if ((impr === 0 || clicks === 0) && cost >= MIN_SPEND_45D) { reasons.push('LOW_SERVE'); if (!suggested) suggested = 'check_bid_or_pause'; }
+      if (ctr_bp !== '' && ctr_bp < LOW_CTR_BP && impr >= MIN_IMPR) { reasons.push('LOW_CTR'); if (!suggested) suggested = 'pause_keyword'; }
+      if (targetCpa && conv >= 5 && cpa !== '' && cpa >= targetCpa * HIGH_CPA_FACTOR) { reasons.push('HIGH_CPA'); if (!suggested) suggested = 'lower_bid'; }
+      if (reasons.length > 0) rowsFlagged.push([runDate, accId, dealerName, String(camp.getId()), camp.getName(), String(ag.getId()), ag.getName(), String(kw.getId()), kw.getText(), kw.getMatchType(), impr, clicks, ctr_bp, conv, cvr_bp, cost, cpa, lostISbp, reasons.join('|'), suggested, kw.isEnabled()]);
+      if ((conv >= 5) && (targetCpa ? (cpa !== '' && cpa <= targetCpa) : (ctr_bp >= 300))) {
+        var topReason = (camp.getAdvertisingChannelType() === 'SEARCH' && lostISbp >= 1000) ? 'BUDGET_HEADROOM' : 'GOOD_PERF';
+        rowsTop.push([runDate, accId, dealerName, String(camp.getId()), camp.getName(), String(ag.getId()), ag.getName(), String(kw.getId()), kw.getText(), kw.getMatchType(), impr, clicks, ctr_bp, conv, cvr_bp, cost, cpa, camp.getAdvertisingChannelType() === 'SEARCH' ? lostISbp : '', topReason, 'increase_bid_or_budget', kw.isEnabled()]);
+      }
+    }
+
+    // ---- Search Terms ----
+    var report = AdsApp.report([
+      'SELECT Query, CampaignId, CampaignName, AdGroupId, AdGroupName, Impressions, Clicks, Ctr, Cost, Conversions, ConversionRate',
+      'FROM SEARCH_QUERY_PERFORMANCE_REPORT',
+      'WHERE CampaignStatus != "REMOVED" AND AdGroupStatus != "REMOVED"',
+      'DURING ' + dr.start + ',' + dr.end
+    ].join(' '));
+    var rows = report.rows();
+    while (rows.hasNext()) {
+      var r = rows.next();
+      var impr = Number(r['Impressions']), clicks = Number(r['Clicks']), ctr_bp = pctToBp(Number(r['Ctr'])), cost = Number(r['Cost']), conv = Number(r['Conversions']), cvr_bp = pctToBp(Number(r['ConversionRate']));
+      if (cost < MIN_SPEND_45D) continue;
+      var normTerm = stripMatchSyntax(r['Query']), existsInAdGroup = kwIndex.byAdGroup[r['AdGroupId']] && kwIndex.byAdGroup[r['AdGroupId']][normTerm], existsInCampaign = kwIndex.byCampaign[r['CampaignId']] && kwIndex.byCampaign[r['CampaignId']][normTerm], existingKeywordMatch = !!(existsInAdGroup || existsInCampaign);
+      if (!existingKeywordMatch && (conv >= MIN_CONV_POS_TERM || (ctr_bp >= HIGH_CTR_POS_TERM_BP && clicks >= MIN_CLICKS))) rowsPos.push([runDate, accId, dealerName, r['CampaignId'], r['CampaignName'], r['AdGroupId'], r['AdGroupName'], r['Query'], impr, clicks, ctr_bp, conv, cvr_bp, cost, 'GOOD_TERM', 'add_keyword', true, existingKeywordMatch]);
+      if (!existingKeywordMatch && conv === 0 && (clicks >= MIN_CLICKS || cost >= 25)) {
+        var reason = 'WASTE';
+        if (/free|cheap|jobs|manual|used parts only|pdf/i.test(normTerm)) reason += '|STOPWORD';
+        rowsNeg.push([runDate, accId, dealerName, r['CampaignId'], r['CampaignName'], r['AdGroupId'], r['AdGroupName'], r['Query'], impr, clicks, ctr_bp, conv, cvr_bp, cost, reason, 'add_negative', 'campaign', true]);
+      }
+    }
+
+    appendRows(shFlagged, headerFlagged, rowsFlagged);
+    appendRows(shTop, headerTop, rowsTop);
+    appendRows(shPos, headerPos, rowsPos);
+    appendRows(shNeg, headerNeg, rowsNeg);
+  }
+
+  setPlainTextColumns(shFlagged, headerFlagged, ['account_id','campaign_id','ad_group_id','keyword_id']);
+  setPlainTextColumns(shTop, headerTop, ['account_id','campaign_id','ad_group_id','keyword_id']);
+}
+
