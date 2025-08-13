@@ -1,0 +1,717 @@
+/**** PolicyAgent v1.0 (Level 1) — Google Ads Scripts (MCC)
+ *  Entry: main()
+ *  Behavior: Only ENABLED ads and ENABLED asset linkers are scanned (no paused).
+ *  Outputs:
+ *    - Spreadsheet ID: OUTPUT_SPREADSHEET_ID
+ *    - Overwrites tabs: POLICY_ENTITIES_TAB, POLICY_ROLLUP_TAB
+ *    - Appends to: HEALTH_LOG_TAB
+ ****/
+
+function main() {
+  runPolicyAgent();
+}
+
+//////////////////////
+// 0) CONSTANTS
+//////////////////////
+const OUTPUT_SPREADSHEET_ID = '1VjU6Rs_44TeXtyXmLJriA9TosTcgA_H3bCT7-ZXk-F4'; // Master sheet
+const POLICY_ENTITIES_TAB   = 'Policy_Entities';
+const POLICY_ROLLUP_TAB     = 'Policy_Rollup';
+const HEALTH_LOG_TAB        = 'NEXUS_Engine_Health_Log';
+
+const DEALER_MASTER_ID   = '18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg';
+const DEALER_MASTER_TAB  = 'Dealer Master';
+
+const ACTIVE_DAYS = 7;                     // last 7 days ending yesterday
+const ACTIVE_MIN_COST_MICROS = 1000000;    // $1 (no underscores)
+const INCLUDE_APPROVED_LIMITED = true;     // include eligibility-limited rows
+
+// Retry for GAQL calls
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 1000;
+
+// Regex
+const NON_DIGIT = /\D/g;
+
+//////////////////////
+// 1) ENTRY POINT
+//////////////////////
+function runPolicyAgent() {
+  var overallStart = Date.now();
+  var mcc = AdsApp.currentAccount();
+  var dealerMap = loadDealerMap_(); // { digitsOnlyAccountId -> Dealer Name }
+
+  var entitiesRows = [];  // rows for Policy_Entities
+  var errors = [];
+  var accountsScanned = 0;
+  var accountsWritten = 0;
+
+  var accIter = AdsManagerApp.accounts().get(); // child accounts under MCC
+  while (accIter.hasNext()) {
+    var acc = accIter.next();
+    accountsScanned++;
+
+    try {
+      AdsManagerApp.select(acc); // switch into child
+      var customerIdDigits = (AdsApp.currentAccount().getCustomerId() || '').replace(NON_DIGIT, '');
+      var dr = getDateRanges_AccountTz_(customerIdDigits);
+      var yesterday = dr.yesterday;
+      var d7Start = dr.d7Start;
+      var d7End = dr.d7End;
+
+      // Active account gate (≥ $1 in last 7 days, enabled campaigns)
+      if (!isActiveAccount_7d_(d7Start, d7End)) {
+        continue;
+      }
+      var last7Cost = getLast7Cost_(d7Start, d7End); // currency units
+
+      // Fetch policies
+      var adRowsRaw = fetchAdPolicy_();
+      var assetRowsRaw = fetchAssetPolicy_();
+
+      var dealerName = dealerMap[customerIdDigits] || '';
+      var runDate = yesterday;
+
+      // Normalize + filter by approval status rules
+      var adRows = [];
+      for (var i = 0; i < adRowsRaw.length; i++) {
+        var r = adRowsRaw[i];
+        var appr = (r.adGroupAd && r.adGroupAd.policySummary) ? r.adGroupAd.policySummary.approvalStatus : '';
+        if (shouldEmitPolicyRow_(appr)) {
+          adRows.push(normalizePolicyRow_({
+            scope: 'AD',
+            row: r,
+            dealerName: dealerName,
+            runDate: runDate,
+            last7Cost: last7Cost,
+            customerIdDigits: customerIdDigits
+          }));
+        }
+      }
+
+      var assetRows = [];
+      for (var j = 0; j < assetRowsRaw.length; j++) {
+        var ar = assetRowsRaw[j];
+        var apprA = (ar.asset && ar.asset.policySummary) ? ar.asset.policySummary.approvalStatus : '';
+        if (shouldEmitPolicyRow_(apprA)) {
+          assetRows.push(normalizePolicyRow_({
+            scope: 'ASSET',
+            row: ar,
+            dealerName: dealerName,
+            runDate: runDate,
+            last7Cost: last7Cost,
+            customerIdDigits: customerIdDigits
+          }));
+        }
+      }
+
+      if (adRows.length || assetRows.length) {
+        accountsWritten++; // only count if at least one row from this account
+        Array.prototype.push.apply(entitiesRows, adRows);
+        Array.prototype.push.apply(entitiesRows, assetRows);
+      }
+
+    } catch (e) {
+      errors.push('Account ' + acc.getCustomerId() + ': ' + (e && e.stack ? e.stack : e));
+      // continue to next account
+    } finally {
+      AdsManagerApp.select(mcc); // back to MCC
+    }
+  }
+
+  // Output
+  try {
+    writePolicyEntities_(entitiesRows);
+    buildAndWriteRollup_(entitiesRows);
+
+    var runtimeSecOK = ((Date.now() - overallStart) / 1000).toFixed(2);
+    logHealth_('OK', {
+      runtimeSec: runtimeSecOK,
+      accountsScanned: accountsScanned,
+      accountsWritten: accountsWritten,
+      errors: errors
+    });
+  } catch (e2) {
+    var runtimeSecERR = ((Date.now() - overallStart) / 1000).toFixed(2);
+    errors.push(e2 && e2.stack ? e2.stack : String(e2));
+    logHealth_('ERROR', {
+      runtimeSec: runtimeSecERR,
+      accountsScanned: accountsScanned,
+      accountsWritten: accountsWritten,
+      errors: errors
+    });
+    throw e2;
+  }
+}
+
+//////////////////////
+// 2) DATE RANGES (per account TZ)
+//////////////////////
+function getDateRanges_AccountTz_(_cidDigits) {
+  var tz = AdsApp.currentAccount().getTimeZone(); // e.g., "America/Los_Angeles"
+  var now = new Date();
+  var end = new Date(now.getTime() - 24 * 60 * 60 * 1000); // yesterday
+  var start = new Date(end.getTime() - (ACTIVE_DAYS - 1) * 24 * 60 * 60 * 1000); // 7-day window
+
+  var fmt = function(d) { return Utilities.formatDate(d, tz, 'yyyy-MM-dd'); };
+  return {
+    yesterday: fmt(end),
+    d7Start: fmt(start),
+    d7End: fmt(end)
+  };
+}
+
+//////////////////////
+// 3) ACTIVE GATE + COST
+//////////////////////
+function isActiveAccount_7d_(d7Start, d7End) {
+  var q =
+    "SELECT campaign.id, metrics.cost_micros " +
+    "FROM campaign " +
+    "WHERE campaign.status = 'ENABLED' " +
+    "AND segments.date BETWEEN '" + d7Start + "' AND '" + d7End + "' " +
+    "AND metrics.cost_micros > " + ACTIVE_MIN_COST_MICROS + " " +
+    "LIMIT 1";
+  var it = safeSearch_(q);
+  return it.hasNext();
+}
+
+function getLast7Cost_(d7Start, d7End) {
+  var q =
+    "SELECT metrics.cost_micros " +
+    "FROM campaign " +
+    "WHERE campaign.status = 'ENABLED' " +
+    "AND segments.date BETWEEN '" + d7Start + "' AND '" + d7End + "'";
+  var micros = 0;
+  var it = safeSearch_(q);
+  while (it.hasNext()) {
+    var row = it.next();
+    var v = (row.metrics && typeof row.metrics.costMicros !== 'undefined') ? row.metrics.costMicros : 0;
+    micros += v || 0;
+  }
+  return +(micros / 1000000).toFixed(2); // currency units
+}
+
+//////////////////////
+// 4) FETCH POLICY DATA (current status)
+//////////////////////
+function fetchAdPolicy_() {
+  // Only enabled ads in enabled containers
+  var q =
+    "SELECT " +
+    " customer.id, " +
+    " campaign.id, campaign.name, campaign.status, " +
+    " ad_group.id, ad_group.name, ad_group.status, " +
+    " ad_group_ad.ad.id, ad_group_ad.ad.type, ad_group_ad.status, " +
+    " ad_group_ad.policy_summary.approval_status, " +
+    " ad_group_ad.policy_summary.review_status, " +
+    " ad_group_ad.policy_summary.policy_topic_entries, " +
+    " ad_group_ad.ad.final_urls " +
+    "FROM ad_group_ad " +
+    "WHERE campaign.status = 'ENABLED' " +
+    "AND ad_group.status = 'ENABLED' " +
+    "AND ad_group_ad.status = 'ENABLED'";
+  var out = [];
+  var it = safeSearch_(q);
+  while (it.hasNext()) out.push(it.next());
+  return out;
+}
+
+function fetchAssetPolicy_() {
+  var rows = [];
+
+  var baseSelect =
+    " asset.id, asset.type, " +
+    " asset.policy_summary.approval_status, " +
+    " asset.policy_summary.review_status, " +
+    " asset.policy_summary.policy_topic_entries, " +
+    " asset.text_asset.text, " +
+    " asset.callout_asset.callout_text, " +
+    " asset.structured_snippet_asset.header, " +
+    " asset.structured_snippet_asset.values ";
+
+  // Ad group scope — only enabled linkers
+  var q1 = "SELECT " + baseSelect + ", ad_group_asset.ad_group, ad_group_asset.status FROM ad_group_asset " +
+           "WHERE ad_group_asset.status = 'ENABLED'";
+  pushAll_(rows, safeSearchCollect_(q1));
+
+  // Campaign scope — only enabled linkers
+  var q2 = "SELECT " + baseSelect + ", campaign_asset.campaign, campaign_asset.status FROM campaign_asset " +
+           "WHERE campaign_asset.status = 'ENABLED'";
+  pushAll_(rows, safeSearchCollect_(q2));
+
+  // Customer scope — only enabled linkers (no customer field in GAQL)
+  var q3 = "SELECT " + baseSelect + ", customer_asset.status FROM customer_asset " +
+           "WHERE customer_asset.status = 'ENABLED'";
+  pushAll_(rows, safeSearchCollect_(q3));
+
+  return rows;
+}
+
+function pushAll_(to, arr) { for (var i = 0; i < arr.length; i++) to.push(arr[i]); }
+function safeSearchCollect_(q) { var out=[]; var it=safeSearch_(q); while (it.hasNext()) out.push(it.next()); return out; }
+
+//////////////////////
+// 5) FILTER + NORMALIZE
+//////////////////////
+function shouldEmitPolicyRow_(approvalStatus) {
+  if (!approvalStatus) return false;
+  if (approvalStatus === 'APPROVED') return false;
+  if (approvalStatus === 'APPROVED_LIMITED') return INCLUDE_APPROVED_LIMITED ? true : false;
+  return true; // DISAPPROVED, PENDING_REVIEW, etc.
+}
+
+function normalizePolicyRow_(args) {
+  var scope = args.scope; // 'AD' or 'ASSET'
+  var row = args.row;
+  var dealerName = args.dealerName;
+  var runDate = args.runDate;
+  var last7Cost = args.last7Cost;
+  var customerIdDigits = args.customerIdDigits;
+
+  var isAd = (scope === 'AD');
+
+  var approval = '';
+  var review = '';
+  var policyEntries = [];
+
+  if (isAd) {
+    approval = (row.adGroupAd && row.adGroupAd.policySummary) ? (row.adGroupAd.policySummary.approvalStatus || '') : '';
+    review   = (row.adGroupAd && row.adGroupAd.policySummary) ? (row.adGroupAd.policySummary.reviewStatus || '') : '';
+    policyEntries = (row.adGroupAd && row.adGroupAd.policySummary && row.adGroupAd.policySummary.policyTopicEntries) ? row.adGroupAd.policySummary.policyTopicEntries : [];
+  } else {
+    approval = (row.asset && row.asset.policySummary) ? (row.asset.policySummary.approvalStatus || '') : '';
+    review   = (row.asset && row.asset.policySummary) ? (row.asset.policySummary.reviewStatus || '') : '';
+    policyEntries = (row.asset && row.asset.policySummary && row.asset.policySummary.policyTopicEntries) ? row.asset.policySummary.policyTopicEntries : [];
+  }
+
+  var topics = [];
+  for (var i = 0; i < (policyEntries || []).length; i++) {
+    var t = policyEntries[i] && policyEntries[i].topic ? policyEntries[i].topic : '';
+    topics.push(normalizeTopicCode_(t));
+  }
+
+  var servingClass = deriveServingClass_(approval, review);
+  var detailsJson = compactPolicyDetails_(policyEntries);
+  var severity = deriveSeverity_(approval, topics);
+  var recommended = deriveRecommendedAction_(approval, topics, review);
+
+  // Scope identifiers and samples
+  var campaignId = '';
+  var campaignName = '';
+  var adGroupId = '';
+  var adGroupName = '';
+  var adId = '';
+  var adType = '';
+  var adStatus = '';
+  var assetId = '';
+  var assetType = '';
+  var assetTextSample = '';
+  var finalUrl = '';
+
+  if (isAd) {
+    campaignId = (row.campaign && typeof row.campaign.id !== 'undefined') ? String(row.campaign.id) : '';
+    campaignName = (row.campaign && row.campaign.name) ? row.campaign.name : '';
+    adGroupId = (row.adGroup && typeof row.adGroup.id !== 'undefined') ? String(row.adGroup.id) : '';
+    adGroupName = (row.adGroup && row.adGroup.name) ? row.adGroup.name : '';
+    adId = (row.adGroupAd && row.adGroupAd.ad && typeof row.adGroupAd.ad.id !== 'undefined') ? String(row.adGroupAd.ad.id) : '';
+    adType = (row.adGroupAd && row.adGroupAd.ad && row.adGroupAd.ad.type) ? row.adGroupAd.ad.type : '';
+    adStatus = (row.adGroupAd && row.adGroupAd.status) ? row.adGroupAd.status : '';
+    if (row.adGroupAd && row.adGroupAd.ad && row.adGroupAd.ad.finalUrls && row.adGroupAd.ad.finalUrls.length) {
+      finalUrl = row.adGroupAd.ad.finalUrls[0];
+    }
+  } else {
+    assetId = (row.asset && typeof row.asset.id !== 'undefined') ? String(row.asset.id) : '';
+    assetType = (row.asset && row.asset.type) ? row.asset.type : '';
+
+    // linker scopes
+    if (row.adGroupAsset && row.adGroupAsset.adGroup) {
+      adGroupId = trailingId_(row.adGroupAsset.adGroup);
+    } else if (row.campaignAsset && row.campaignAsset.campaign) {
+      campaignId = trailingId_(row.campaignAsset.campaign);
+    } else {
+      // customer scope — leave campaign/ad group blank
+    }
+
+    // best-effort text sample
+    if (row.asset) {
+      if (row.asset.textAsset && row.asset.textAsset.text) {
+        assetTextSample = row.asset.textAsset.text;
+      } else if (row.asset.calloutAsset && row.asset.calloutAsset.calloutText) {
+        assetTextSample = row.asset.calloutAsset.calloutText;
+      } else if (row.asset.structuredSnippetAsset && row.asset.structuredSnippetAsset.header) {
+        var header = row.asset.structuredSnippetAsset.header;
+        var vals = (row.asset.structuredSnippetAsset.values || []).join(', ');
+        assetTextSample = header + ': ' + vals;
+      }
+    }
+  }
+
+  return [
+    // Policy_Entities schema — exact order
+    runDate,                                // run_date (YYYY-MM-DD)
+    customerIdDigits,                       // account_id (digits only)
+    dealerName,                             // dealer_name
+    isAd ? 'AD' : 'ASSET',                  // entity_type
+    campaignId,                             // campaign_id
+    campaignName,                           // campaign_name
+    adGroupId,                              // ad_group_id
+    adGroupName,                            // ad_group_name
+    adId,                                   // ad_id
+    adType,                                 // ad_type
+    adStatus,                               // ad_status
+    assetId,                                // asset_id
+    assetType,                              // asset_type
+    assetTextSample,                        // asset_text_sample
+    approval,                               // approval_status
+    review,                                 // review_status
+    servingClass,                           // serving_class
+    topics.join('|'),                       // policy_topics
+    detailsJson,                            // policy_details_json
+    finalUrl,                               // final_url
+    last7Cost,                              // last7_cost (number)
+    severity,                               // severity
+    recommended,                            // recommended_action
+    ''                                      // notes
+  ];
+}
+
+function trailingId_(resourceName) {
+  if (!resourceName) return '';
+  var idx = resourceName.lastIndexOf('/');
+  return (idx >= 0) ? resourceName.substring(idx + 1) : resourceName;
+}
+
+function normalizeTopicCode_(topic) {
+  if (!topic) return '';
+  return String(topic).trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+}
+
+function deriveServingClass_(approval, review) {
+  if (approval === 'DISAPPROVED') return 'NOT_SERVING';
+  var reviewUpper = (review || '').toUpperCase();
+  if (approval === 'APPROVED_LIMITED' || reviewUpper === 'PENDING_REVIEW' || reviewUpper === 'UNDER_REVIEW' || reviewUpper === 'REVIEW_IN_PROGRESS') {
+    return 'LIMITED';
+  }
+  if (approval === 'APPROVED') return 'SERVING';
+  return 'LIMITED';
+}
+
+function compactPolicyDetails_(entries) {
+  try {
+    var arr = [];
+    for (var i = 0; i < (entries || []).length; i++) {
+      var e = entries[i] || {};
+      var out = { topic: normalizeTopicCode_(e.topic) };
+      if (e.evidences && e.evidences.length) {
+        var types = [];
+        for (var j = 0; j < e.evidences.length; j++) {
+          var ev = e.evidences[j] || {};
+          var keys = Object.keys(ev);
+          if (keys.length) types.push(String(keys[0]).toUpperCase());
+        }
+        if (types.length) out.evidence = types.join(',');
+      }
+      arr.push(out);
+    }
+    return JSON.stringify(arr);
+  } catch (err) {
+    return '[]';
+  }
+}
+
+function deriveSeverity_(approval, topics) {
+  function has(needle) {
+    for (var i = 0; i < topics.length; i++) if (String(topics[i]).indexOf(needle) >= 0) return true;
+    return false;
+  }
+  var criticalTopics = ['DESTINATION_NOT_WORKING', 'MISREPRESENTATION', 'UNACCEPTABLE_BUSINESS_PRACTICES', 'MALWARE', 'DANGEROUS_PRODUCTS'];
+
+  for (var c = 0; c < criticalTopics.length; c++) {
+    if (approval === 'DISAPPROVED' && has(criticalTopics[c])) return 'CRITICAL';
+  }
+  if (approval === 'APPROVED_LIMITED') return 'HIGH';
+  if (approval === 'DISAPPROVED' && (has('EDITORIAL') || has('TRADEMARK'))) return 'HIGH';
+  return 'MEDIUM'; // coarse baseline
+}
+
+function deriveRecommendedAction_(approval, topics, review) {
+  function has(n) {
+    for (var i = 0; i < topics.length; i++) if (String(topics[i]).indexOf(n) >= 0) return true;
+    return false;
+  }
+  for (var i = 0; i < topics.length; i++) {
+    if (String(topics[i]).indexOf('DESTINATION') === 0) {
+      return (approval === 'DISAPPROVED') ? 'PAUSE_AD' : 'FIX_URL';
+    }
+  }
+  if (has('MISREPRESENTATION') || has('UNACCEPTABLE_BUSINESS_PRACTICES')) return 'ESCALATE_LEGAL';
+  if (has('TRADEMARK') || has('EDITORIAL')) return 'REWRITE_ASSETS';
+  if (approval === 'APPROVED_LIMITED') return 'NOTE_ONLY';
+  var reviewU = (review || '').toUpperCase();
+  if (reviewU === 'PENDING_REVIEW' || reviewU === 'UNDER_REVIEW' || reviewU === 'REVIEW_IN_PROGRESS') return 'REQUEST_REVIEW';
+  return 'NOTE_ONLY';
+}
+
+//////////////////////
+// 6) WRITE OUTPUTS
+//////////////////////
+function writePolicyEntities_(rows) {
+  var ss = SpreadsheetApp.openById(OUTPUT_SPREADSHEET_ID);
+  var sheet = getOrCreateSheet_(ss, POLICY_ENTITIES_TAB);
+
+  var header = [
+    'run_date',
+    'account_id',
+    'dealer_name',
+    'entity_type',
+    'campaign_id',
+    'campaign_name',
+    'ad_group_id',
+    'ad_group_name',
+    'ad_id',
+    'ad_type',
+    'ad_status',
+    'asset_id',
+    'asset_type',
+    'asset_text_sample',
+    'approval_status',
+    'review_status',
+    'serving_class',
+    'policy_topics',
+    'policy_details_json',
+    'final_url',
+    'last7_cost',
+    'severity',
+    'recommended_action',
+    'notes'
+  ];
+
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, header.length).setValues([header]);
+  if (rows && rows.length) {
+    sheet.getRange(2, 1, rows.length, header.length).setValues(rows);
+  }
+
+  // Force Plain text for ID columns (guard against 0-row ranges)
+  var idCols = ['account_id','campaign_id','ad_group_id','ad_id','asset_id'];
+  var colIndex = {};
+  for (var i = 0; i < header.length; i++) colIndex[header[i]] = i + 1;
+
+  var lastRow = sheet.getLastRow();           // includes header
+  var dataRows = lastRow - 1;                 // exclude header
+  if (dataRows > 0) {
+    for (var k = 0; k < idCols.length; k++) {
+      var name = idCols[k];
+      var idx = colIndex[name];
+      if (!idx) continue;
+      var rng = sheet.getRange(2, idx, dataRows, 1);
+      rng.setNumberFormat('@'); // Plain text
+    }
+  }
+}
+
+function buildAndWriteRollup_(entityRows) {
+  var header = [
+    'run_date',
+    'account_id',
+    'dealer_name',
+    'issues_total',
+    'issues_critical',
+    'issues_high',
+    'issues_medium',
+    'issues_low',
+    'disapproved_ads',
+    'approved_limited',
+    'asset_issues',
+    'destination_issues',
+    'trademark_issues',
+    'misrepresentation_issues',
+    'last7_cost',
+    'top_actions'
+  ];
+
+  // Indices from entities schema
+  var COL = {
+    run_date: 0,
+    account_id: 1,
+    dealer_name: 2,
+    entity_type: 3,
+    approval_status: 14,
+    policy_topics: 17,
+    last7_cost: 20,
+    severity: 21,
+    recommended_action: 22
+  };
+
+  var byAcct = {};
+  for (var i = 0; i < (entityRows || []).length; i++) {
+    var r = entityRows[i];
+    var acct = r[COL.account_id];
+    if (!byAcct[acct]) {
+      byAcct[acct] = {
+        runDate: r[COL.run_date],
+        accountId: acct,
+        dealerName: r[COL.dealer_name],
+        total: 0,
+        sev: { CRITICAL:0, HIGH:0, MEDIUM:0, LOW:0 },
+        disapprovedAds: 0,
+        approvedLimited: 0,
+        assetIssues: 0,
+        destIssues: 0,
+        tmIssues: 0,
+        misrepIssues: 0,
+        last7: 0,
+        actionCounts: {}
+      };
+    }
+    var b = byAcct[acct];
+    b.total += 1;
+
+    var sev = r[COL.severity] || 'LOW';
+    if (typeof b.sev[sev] === 'undefined') b.sev[sev] = 0;
+    b.sev[sev] += 1;
+
+    if (r[COL.entity_type] === 'ASSET') b.assetIssues += 1;
+
+    var approval = r[COL.approval_status];
+    if (approval === 'DISAPPROVED' && r[COL.entity_type] === 'AD') b.disapprovedAds += 1;
+    if (approval === 'APPROVED_LIMITED') b.approvedLimited += 1;
+
+    var topics = (r[COL.policy_topics] || '').split('|').filter(Boolean);
+    for (var t = 0; t < topics.length; t++) {
+      var tp = topics[t];
+      if (tp.indexOf('DESTINATION') >= 0) b.destIssues += 1;
+      if (tp.indexOf('TRADEMARK') >= 0) b.tmIssues += 1;
+      if (tp.indexOf('MISREPRESENTATION') >= 0 || tp.indexOf('UNACCEPTABLE_BUSINESS_PRACTICES') >= 0) b.misrepIssues += 1;
+    }
+
+    b.last7 = r[COL.last7_cost] || b.last7;
+
+    var act = r[COL.recommended_action] || 'NOTE_ONLY';
+    if (!b.actionCounts[act]) b.actionCounts[act] = 0;
+    b.actionCounts[act] += 1;
+  }
+
+  var rollRows = [];
+  var keys = Object.keys(byAcct);
+  for (var k = 0; k < keys.length; k++) {
+    var acctId = keys[k];
+    var b = byAcct[acctId];
+    var topActs = Object.keys(b.actionCounts)
+      .sort(function(a, z) { return b.actionCounts[z] - b.actionCounts[a]; })
+      .slice(0, 3)
+      .join('|');
+
+    rollRows.push([
+      b.runDate,
+      b.accountId,
+      b.dealerName,
+      b.total,
+      b.sev.CRITICAL,
+      b.sev.HIGH,
+      b.sev.MEDIUM,
+      b.sev.LOW,
+      b.disapprovedAds,
+      b.approvedLimited,
+      b.assetIssues,
+      b.destIssues,
+      b.tmIssues,
+      b.misrepIssues,
+      b.last7,
+      topActs
+    ]);
+  }
+
+  var ss = SpreadsheetApp.openById(OUTPUT_SPREADSHEET_ID);
+  var sheet = getOrCreateSheet_(ss, POLICY_ROLLUP_TAB);
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, header.length).setValues([header]);
+  if (rollRows.length) {
+    sheet.getRange(2, 1, rollRows.length, header.length).setValues(rollRows);
+  }
+
+  // Force plain text on account_id column (guard for 0 data rows)
+  var lastRow = sheet.getLastRow();      // includes header
+  var dataRows = lastRow - 1;            // exclude header
+  if (dataRows > 0) {
+    var accountIdCol = 2;
+    var rng = sheet.getRange(2, accountIdCol, dataRows, 1);
+    rng.setNumberFormat('@');
+  }
+}
+
+//////////////////////
+// 7) DEALER MASTER JOIN
+//////////////////////
+function loadDealerMap_() {
+  var ss = SpreadsheetApp.openById(DEALER_MASTER_ID);
+  var sh = ss.getSheetByName(DEALER_MASTER_TAB);
+  if (!sh) return {};
+
+  var values = sh.getDataRange().getValues();
+  if (!values.length) return {};
+  var header = [];
+  for (var i = 0; i < values[0].length; i++) header.push(String(values[0][i] || '').trim().toLowerCase());
+
+  var gidIdx = header.indexOf('google account id');
+  var dnIdx = header.indexOf('dealer name');
+  if (gidIdx === -1 || dnIdx === -1) return {};
+
+  var map = {};
+  for (var r = 1; r < values.length; r++) {
+    var accRaw = (values[r][gidIdx] || '').toString();
+    var accDigits = accRaw.replace(NON_DIGIT, '');
+    if (!accDigits) continue;
+    var name = (values[r][dnIdx] || '').toString();
+    map[accDigits] = name;
+  }
+  return map;
+}
+
+//////////////////////
+// 8) HEALTH LOG (append)
+//////////////////////
+function logHealth_(status, meta) {
+  var ss = SpreadsheetApp.openById(OUTPUT_SPREADSHEET_ID);
+  var sh = getOrCreateSheet_(ss, HEALTH_LOG_TAB);
+
+  // Use Ads account timezone (Session is not available in Ads Scripts)
+  var tz = AdsApp.currentAccount().getTimeZone();
+  var ts = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
+
+  var row = [
+    'NEXUS PolicyAgent v1.0',                 // Engine Name
+    ts,                                        // Timestamp
+    status,                                    // Status
+    meta.runtimeSec || '',                     // Runtime (s)
+    meta.accountsScanned || 0,                 // Accounts Scanned
+    meta.accountsWritten || 0,                 // Accounts Written
+    (meta.errors && meta.errors.length) ? meta.errors.join(' || ') : '' // Errors
+  ];
+
+  var last = sh.getLastRow();
+  sh.getRange(last + 1, 1, 1, row.length).setValues([row]);
+}
+
+//////////////////////
+// 9) HELPERS
+//////////////////////
+function getOrCreateSheet_(ss, name) {
+  var sh = ss.getSheetByName(name);
+  if (sh) return sh;
+  return ss.insertSheet(name);
+}
+
+function safeSearch_(gaql) {
+  var attempt = 0;
+  while (true) {
+    try {
+      return AdsApp.search(gaql); // iterator
+    } catch (e) {
+      attempt++;
+      if (attempt >= MAX_RETRIES) throw e;
+      Utilities.sleep(RETRY_BASE_MS * Math.pow(2, attempt - 1));
+    }
+  }
+}
