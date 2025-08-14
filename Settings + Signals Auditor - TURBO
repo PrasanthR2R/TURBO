@@ -1,816 +1,938 @@
-/******** NEXUS – Settings + Signals Auditor (Google Ads Scripts)
- * Scope: MCC or single account
- * Outputs (append-only; headers if missing; nothing else touched):
- *   - Settings_Audit
- *   - Performance_Levers
- * Health log:
- *   - NEXUS_Engine_Health_Log
- *
- * THIS VERSION:
- *   - Scans ALL accessible accounts (no currency or spend filter).
- *   - MCC batching ≤50 with hard de-duplication of customer IDs.
- *   - Partners/Device via GAQL (no deprecated fields).
- *   - Customer/conversion/auto-apply via GAQL when available; otherwise logs
- *     "Unavailable in Scripts" with a precise UI fix path.
- ***********************************************************************/
+/*************************************************************
+ * NEXUS — Settings + Signals Auditor (Apps Script, Google Ads API)
+ * Runs from Google Sheets → Extensions → Apps Script.
+ * - Calls Google Ads API via REST (searchStream) using OAuth refresh token.
+ * - Writes to your existing tabs (append-only):
+ *     Settings_Audit, Performance_Levers, NEXUS_Engine_Health_Log
+ * - No local files (no google-ads.yaml, no token.json).
+ **************************************************************/
 
-/*** ===== CONSTANTS ===== ***/
-// Your output Google Sheet (TURBO). You can create new tabs here.
-var SPREADSHEET_URL = 'https://docs.google.com/spreadsheets/d/1VjU6Rs_44TeXtyXmLJriA9TosTcgA_H3bCT7-ZXk-F4/edit#gid=1299411243';
+/** ================= HARD-CODED CONFIG (LIVE — HANDLE WITH CARE) ================= **/
+const CONFIG = {
+  // Google Ads MCC (no dashes)
+  LOGIN_CUSTOMER_ID: '9684986590',
 
-// Analysis window for performance levers
-var WINDOW_METRICS   = 'LAST_30_DAYS';
+  // ---- Your API creds (rotated) ----
+  DEVELOPER_TOKEN:   'AdjR3yEAQDH206kqe7N5kg',
+  CLIENT_ID:         '759464769302-cdsueuf69ro8jnmmupl7mfj0pceqaa64.apps.googleusercontent.com',
+  CLIENT_SECRET:     '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',
+  REFRESH_TOKEN:     '1//04ft7GM30EMFsCgYIARAAGAQSNwF-L9IrHrF9ohKw9gJyXX7GSvEv1JH0f6kSoU6DhZaKum6-odIY9mkq1LrGpJNzBxvTUwNDZCA',
 
-// Partners thresholds
-var PARTNERS_SPEND_ZERO_CONV = 50;
-var PARTNERS_MIN_SPEND_ALERT = 25;
-var PARTNERS_CPA_RATIO_LIMIT = 1.5;
-var PARTNERS_CTR_RATIO_LIMIT = 0.6;
+  // Output sheet (you gave a gid URL; we auto-normalize to base)
+  OUTPUT_SHEET_URL:  'https://docs.google.com/spreadsheets/d/1VjU6Rs_44TeXtyXmLJriA9TosTcgA_H3bCT7-ZXk-F4/edit?gid=983095729#gid=983095729',
 
-// Device/Geo thresholds
-var DEVGEO_MIN_SPEND = 30;
-var DEVGEO_MAX_MOD   = 0.40;              // cap ±40%
-var DEVGEO_STEP      = 0.10;              // 10% steps
+  // API version (we’ll auto-resolve to the latest supported in preflight)
+  API_VERSION: 'v21',
 
-// Required language(s) for Search/PMAX check
-var LANG_REQUIRED = ['English'];
+  // Windows & thresholds
+  WINDOW_METRICS: 'LAST_30_DAYS',
+  PARTNERS_SPEND_ZERO_CONV: 50,
+  PARTNERS_MIN_SPEND_ALERT: 25,
+  PARTNERS_CPA_RATIO_LIMIT: 1.5,
+  PARTNERS_CTR_RATIO_LIMIT: 0.6,
+  DEVGEO_MIN_SPEND: 30,
+  DEVGEO_MAX_MOD: 0.40,
+  DEVGEO_STEP: 0.10,
+  REQUIRE_LANG: ['English'],
 
-// If you want to validate campaign-level required conversions later, add names:
-var REQUIRED_CONVERSION_NAMES = [];       // e.g., ['Lead form','Phone call','GA4 Lead']
+  // Risky auto-apply hints (fallback guard)
+  RISKY_AUTO_APPLY_HINTS: ['BROAD_MATCH','CREATE_SEARCH','AUTO_ASSET','AUTO.*ASSET','RAISE_BUDGET'],
 
-// MCC batching (hard platform limits)
-var BATCH_SIZE            = 50;           // executeInParallel supports up to 50 accounts per call
-var MAX_PARALLEL_THREADS  = 50;           // run up to 50 in parallel
+  // Kid-safety regex for excluded placements (case-insensitive)
+  KID_SAFETY_RE: new RegExp([
+    '(?:child|children|kids?|toddler|baby|babies|nursery|preschool|kindergarten|daycare|childcare|school|schools|elementary|middle[\\s-]?school)',
+    '(?:cartoon|nursery\\s?rhymes|lullaby|phonics|alphabet|abc|123|color(?:ing|[\\s-]?by[\\s-]?number)|storytime)',
+    '(?:\\btoy(s)?\\b(?!ota)|lego|barbie|hasbro|mattel|play[\\s-]?doh|fisher[\\s-]?price|hot[\\s-]?wheels)',
+    '(?:cocomelon|peppa(?:\\s|-)?pig|paw(?:\\s|-)?patrol|pj(?:\\s|-)?masks|nick(?:\\s|-)?jr|disney(?:\\s|-)?junior|baby(?:\\s|-)?tv)',
+    '(?:roblox|minecraft|fortnite|coolmathgames|y8\\.com|miniclip|poki\\.com|friv)',
+    '(?:play\\.google\\.com\\/store\\/apps\\/details.*(?:kids|family|educat|games)|apps\\.apple\\.com\\/.*\\/app\\/.*(?:kids|family|learn|abc|games))'
+  ].join('|'), 'i'),
 
-// Optional: limit MCC scope to labeled accounts (leave [] to include all)
-var MCC_ACCOUNT_LABEL_FILTERS = [];       // e.g., ['Active Dealers']
+  // Tabs & headers
+  TAB_SETTINGS: 'Settings_Audit',
+  TAB_LEVERS:   'Performance_Levers',
+  TAB_HEALTH:   'NEXUS_Engine_Health_Log',
+  HDR_SETTINGS: ['Date','Customer ID','Account','Campaign ID','Campaign','Check','Current','Expected','Severity','Fix Tip'],
+  HDR_LEVERS:   ['Date','Customer ID','Account','Campaign ID','Campaign','Scope','Target','Spend','Conversions','CPA','Baseline CPA','Delta %','Suggested Modifier','Reason'],
+  HDR_HEALTH:   ['Date','Module','Accounts Scanned','Findings Count','Errors'],
+};
+/** ============================================================================ **/
 
-// Tabs
-var TAB_SETTINGS = 'Settings_Audit';
-var TAB_LEVERS   = 'Performance_Levers';
-var TAB_HEALTH   = 'NEXUS_Engine_Health_Log';
+/** =============================== ENTRY =============================== **/
+function runNexusAudit() {
+  preflight_(); // sets API_VERSION if needed, normalizes sheet URL
 
-// Headers (exact order, enforced)
-var HDR_SETTINGS = [
-  'Date','Customer ID','Account','Campaign ID','Campaign','Check','Current','Expected','Severity','Fix Tip'
-];
+  const started = new Date();
+  const tz = Session.getScriptTimeZone() || 'UTC';
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
 
-var HDR_LEVERS = [
-  'Date','Customer ID','Account','Campaign ID','Campaign',
-  'Scope','Target','Spend','Conversions','CPA','Baseline CPA','Delta %','Suggested Modifier','Reason'
-];
+  const ss = SpreadsheetApp.openByUrl(normalizeSheetUrl_(CONFIG.OUTPUT_SHEET_URL));
+  const shSettings = ensureSheet_(ss, CONFIG.TAB_SETTINGS, CONFIG.HDR_SETTINGS);
+  const shLevers   = ensureSheet_(ss, CONFIG.TAB_LEVERS,   CONFIG.HDR_LEVERS);
+  const shHealth   = ensureSheet_(ss, CONFIG.TAB_HEALTH,   CONFIG.HDR_HEALTH);
 
-var HDR_HEALTH = ['Date','Module','Accounts Scanned','Findings Count','Errors'];
-
-// Kid-safety patterns (single OR-regex; case-insensitive). Toyota guard included.
-var KID_SAFETY_REGEX = new RegExp([
-  '(?:child|children|kids?|toddler|baby|babies|nursery|preschool|kindergarten|daycare|childcare|school|schools|elementary|middle[\\s-]?school)',
-  '(?:cartoon|nursery\\s?rhymes|lullaby|phonics|alphabet|abc|123|color(?:ing|[\\s-]?by[\\s-]?number)|storytime)',
-  '(?:\\btoy(s)?\\b(?!ota)|lego|barbie|hasbro|mattel|play[\\s-]?doh|fisher[\\s-]?price|hot[\\s-]?wheels)',
-  '(?:cocomelon|peppa(?:\\s|-)?pig|paw(?:\\s|-)?patrol|pj(?:\\s|-)?masks|nick(?:\\s|-)?jr|disney(?:\\s|-)?junior|baby(?:\\s|-)?tv)',
-  '(?:roblox|minecraft|fortnite|coolmathgames|y8\\.com|miniclip|poki\\.com|friv)',
-  '(?:play\\.google\\.com\\/store\\/apps\\/details.*(?:kids|family|educat|games)|apps\\.apple\\.com\\/.*\\/app\\/.*(?:kids|family|learn|abc|games))'
-].join('|'), 'i');
-
-/*** ===== ENTRY ===== ***/
-function main () {
-  var isMcc = isManagerScope_();
-  if (!isMcc) {
-    var result = scanSingleAccount_(JSON.stringify({ sheetUrl: SPREADSHEET_URL }));
-    var r = safeJsonParse_(result, {});
-    writeHealthLog_([r]);
-    return;
-  }
-
-  // MCC path with strict batching (≤50) and hard de-duplication
-  var allIds = getAllAccountIdsDedup_(); // returns array of unique customer IDs (with dashes)
-  var input  = JSON.stringify({ sheetUrl: SPREADSHEET_URL });
-
-  for (var i = 0; i < allIds.length; i += BATCH_SIZE) {
-    var chunk = allIds.slice(i, i + BATCH_SIZE);
-    AdsManagerApp.accounts()
-      .withIds(chunk)
-      .executeInParallel('scanSingleAccount_', 'onComplete_', input, MAX_PARALLEL_THREADS);
-  }
-}
-
-/*** ===== PARALLEL WORKER (runs in child scope) ===== ***/
-function scanSingleAccount_(inputJson) {
-  var input = safeJsonParse_(inputJson, {});
-  var sheetUrl = input.sheetUrl || SPREADSHEET_URL;
-
-  var out = {
-    cid: getCid_(),
-    name: AdsApp.currentAccount().getName(),
-    findings: 0,
-    errors: 0,
-    scanned: 0,
-    reason: ''
-  };
+  let findings = 0, errors = 0, scanned = 0;
 
   try {
-    var tz = AdsApp.currentAccount().getTimeZone();
-    var today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
-
-    var settingsFindings = [];
-    var leverFindings = [];
-
-    // ====== Campaign-level scans (SEARCH) ======
-    var searchIt = AdsApp.campaigns()
-      .withCondition("AdvertisingChannelType = SEARCH")
-      .withCondition("Status = ENABLED")
-      .get();
-
-    while (searchIt.hasNext()) {
-      var c = searchIt.next();
-      var cInfo = { id: String(c.getId()), name: c.getName() };
-
-      // A1 Networks — Search partners OFF; Display expansion OFF; Search network ON
+    const clients = listLeafClients_(); // [{customerId,name}]
+    clients.forEach(c => {
       try {
-        var ns = c.getNetworkSettings && c.getNetworkSettings();
-        if (ns && ns.isSearchPartnerNetworkEnabled && ns.isSearchPartnerNetworkEnabled()) {
-          settingsFindings.push(makeSettingsRow_(today, cInfo, 'Search Partners', 'ON', 'OFF', 'High',
-            'Settings → Networks → uncheck "Include Google search partners".'));
-        }
-        if (ns && ns.isContentNetworkEnabled && ns.isContentNetworkEnabled()) {
-          settingsFindings.push(makeSettingsRow_(today, cInfo, 'Display Expansion', 'ON', 'OFF', 'High',
-            'Settings → Networks → uncheck "Include Google Display Network".'));
-        }
-        if (ns && ns.isSearchNetworkEnabled && !ns.isSearchNetworkEnabled()) {
-          settingsFindings.push(makeSettingsRow_(today, cInfo, 'Search Network', 'OFF', 'ON', 'High',
-            'Campaign → Settings → Networks → enable Search Network.'));
-        }
-      } catch (eNet) {
-        settingsFindings.push(makeSettingsRow_(today, cInfo, 'Networks', 'Unavailable in Scripts', 'Search=ON, Partners=OFF, Display=OFF', 'Info',
-          'Campaign → Settings → Networks.'));
+        const rows = auditOneClient_(c.customerId, c.name, today);
+        if (rows.settings.length) { appendRows_(shSettings, rows.settings, CONFIG.HDR_SETTINGS.length); findings += rows.settings.length; }
+        if (rows.levers.length)   { appendRows_(shLevers,   rows.levers,   CONFIG.HDR_LEVERS.length);   findings += rows.levers.length; }
+        scanned++;
+      } catch (e) {
+        errors++;
+        appendRows_(shSettings, [
+          [today, c.customerId, c.name, '', '', 'Client Audit Error', String(e), '—', 'High', 'Check API access & permissions.']
+        ], CONFIG.HDR_SETTINGS.length);
       }
+    });
+  } catch (e) {
+    errors++;
+    appendRows_(shSettings, [
+      [today, noDash_(CONFIG.LOGIN_CUSTOMER_ID), 'MCC Worker Error', '', '', 'Global Error', String(e), '—', 'High', 'Check credentials & quotas.']
+    ], CONFIG.HDR_SETTINGS.length);
+  }
 
-      // A2 Location Options — Presence only (not exposed → Info row)
-      settingsFindings.push(makeSettingsRow_(today, cInfo, 'Location Option', 'Unavailable in Scripts', 'PRESENCE', 'Info',
-        'Location options → select "Presence: People in or regularly in your included locations".'));
+  appendRows_(shHealth, [
+    [today, 'Settings+Signals(API)', scanned, findings, errors]
+  ], CONFIG.HDR_HEALTH.length);
 
-      // A3 Conversion selections (info note until Scripts exposes full mapping)
-      if (REQUIRED_CONVERSION_NAMES && REQUIRED_CONVERSION_NAMES.length) {
-        settingsFindings.push(makeSettingsRow_(today, cInfo, 'Conversion Selection', 'Unavailable in Scripts', 'All required', 'Info',
-          'Campaign settings → Choose conversion goals → include all lead conversions.'));
+  Logger.log('Done. accounts=%s findings=%s errors=%s in %s sec', scanned, findings, errors, Math.round((new Date() - started)/1000));
+}
+
+/** ========================= PER-CLIENT AUDIT ========================= **/
+function auditOneClient_(customerId, accountName, dateStr) {
+  const settingsRows = [];
+  const leverRows    = [];
+
+  // conversion customer (cross-account)
+  const convCust = getConversionCustomer_(customerId) || customerId;
+
+  // ECFL (conversion customer)
+  try {
+    const ecfl = getECFLEnabled_(convCust);
+    if (!ecfl) {
+      settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Enhanced Conversions for Leads', 'OFF', 'ON', 'High', 'Goals → Settings → Turn on enhanced conversions for leads.'));
+    }
+  } catch (e) {
+    settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Enhanced Conversions for Leads', 'Access/Query Error', 'ON', 'High', 'Ensure MCC can read conversion customer.'));
+  }
+
+  // Call reporting + default call action (client)
+  try {
+    const callCfg = getCallReporting_(customerId); // {enabled, actionResName}
+    if (!callCfg.enabled) {
+      settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Call Reporting', 'OFF', 'ON', 'High', 'Goals → Settings → Enable call reporting.'));
+    }
+    if (!callCfg.actionResName) {
+      settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Call Conversion Action', 'None', 'Enabled + Default', 'High', 'Goals → Settings → Call conversion action (select default).'));
+    } else {
+      // try to read the action details (client first, then conversion customer)
+      let det = getConversionActionByRes_(customerId, callCfg.actionResName);
+      if (!det && convCust !== customerId) det = getConversionActionByRes_(convCust, callCfg.actionResName);
+      if (det) {
+        if (String(det.status).toUpperCase() !== 'ENABLED') {
+          settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Call Conversion Action', `${det.name} (${det.status})`, 'ENABLED', 'High', 'Goals → Conversions → enable this action.'));
+        }
+        if (!/CALL/i.test(String(det.category))) {
+          settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Call Conversion Action', `${det.name} (category=${det.category})`, 'CALL category', 'High', 'Goals → Conversions → set default to a Call-type action.'));
+        }
+      } else {
+        settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Call Conversion Action', 'Default set (details unreadable)', 'CALL-type & ENABLED', 'Info', 'Goals → Conversions → confirm default is a Call-type action.'));
       }
+    }
+  } catch (e) {
+    settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Call Reporting / Default Call', 'Access/Query Error', 'ON + Default', 'High', 'Verify permissions.'));
+  }
 
-      // A8 Language targeting — English only
+  // Auto-apply subscriptions (client)
+  try {
+    const subs = listAutoApply_(customerId); // [{type,status}]
+    subs.filter(s => s.status === 'ENABLED').forEach(s => {
+      const sev = isRiskySub_(s.type) ? 'High' : 'Info';
+      settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Auto-apply Recommendation', prettySub_(s.type) + ' ON', 'OFF', sev, 'Recommendations → Auto-apply → turn OFF.'));
+    });
+  } catch (e) {
+    settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Auto-apply Recommendation', 'Access/Query Error', 'OFF (risky items)', 'Info', 'Open Recommendations → Auto-apply.'));
+  }
+
+  // Conversion actions: Primary vs Secondary + Attribution (conv. customer with fallback)
+  try {
+    let acts = [];
+    let note = '';
+    try {
+      acts = listConversionActions_(convCust);
+    } catch (e1) {
+      note = `Conv customer ${convCust} blocked: ${String(e1).slice(0,120)}…`;
+    }
+    if (!acts.length && convCust !== customerId) {
       try {
-        var langs = [];
-        var langIt = c.targeting && c.targeting().languages().get();
-        if (langIt) while (langIt.hasNext()) {
-          var lang = langIt.next();
-          if (lang.getName) langs.push(lang.getName());
-        }
-        var currentLang = langs.length ? langs.join(', ') : 'All languages';
-        var isOk = (langs.length === 1 && langs[0] === 'English');
-        if (!isOk) {
-          settingsFindings.push(makeSettingsRow_(today, cInfo, 'Language Targeting', currentLang, 'English only', 'Medium',
-            'Campaign → Additional settings → Languages → set to English.'));
-        }
-      } catch (eLang) {
-        settingsFindings.push(makeSettingsRow_(today, cInfo, 'Language Targeting', 'Unavailable in Scripts', 'English only', 'Info',
-          'Campaign → Additional settings → Languages → set to English.'));
+        acts = listConversionActions_(customerId);
+        if (note) note += ' | fell back to client account';
+      } catch(e2) {
+        note = note ? note + ' | ' + String(e2) : String(e2);
       }
-
-      // A9 Kid-safety excluded placements (campaign + ad group)
-      try {
-        var epIt = c.targeting && c.targeting().excludedPlacements().get();
-        if (epIt) while (epIt.hasNext()) {
-          var ep = epIt.next();
-          var url = ep.getUrl && ep.getUrl();
-          if (url && KID_SAFETY_REGEX.test(url)) {
-            settingsFindings.push(makeSettingsRow_(today, cInfo, 'Excluded Placement (Kid-Safety)', url, 'Excluded', 'Info', 'Brand safety ✓'));
-          }
-        }
-        var agIt = c.adGroups().get();
-        while (agIt.hasNext()) {
-          var ag = agIt.next();
-          var agEpIt = ag.targeting && ag.targeting().excludedPlacements().get();
-          if (agEpIt) while (agEpIt.hasNext()) {
-            var agp = agEpIt.next();
-            var aurl = agp.getUrl && agp.getUrl();
-            if (aurl && KID_SAFETY_REGEX.test(aurl)) {
-              settingsFindings.push(makeSettingsRow_(today, cInfo, 'Excluded Placement (Kid-Safety)', aurl, 'Excluded', 'Info', 'Brand safety ✓'));
-            }
-          }
-        }
-      } catch(ePlace) {}
     }
-
-    // PMax: Language targeting
-    try {
-      var pmaxIt = AdsApp.performanceMaxCampaigns().withCondition("Status = ENABLED").get();
-      while (pmaxIt.hasNext()) {
-        var p = pmaxIt.next();
-        var pInfo = { id: String(p.getId()), name: p.getName() };
-        try {
-          var plangs = [];
-          var plIt = p.targeting && p.targeting().languages().get();
-          if (plIt) while (plIt.hasNext()) {
-            var pl = plIt.next();
-            if (pl.getName) plangs.push(pl.getName());
-          }
-          var currentP = plangs.length ? plangs.join(', ') : 'All languages';
-          var pOk = (plangs.length === 1 && plangs[0] === 'English');
-          if (!pOk) {
-            settingsFindings.push(makeSettingsRow_(today, pInfo, 'Language Targeting', currentP, 'English only', 'Medium',
-              'Campaign → Additional settings → Languages → set to English.'));
-          }
-        } catch (ePmaxLang) {
-          settingsFindings.push(makeSettingsRow_(today, pInfo, 'Language Targeting', 'Unavailable in Scripts', 'English only', 'Info',
-            'Campaign → Additional settings → Languages → set to English.'));
+    if (acts.length) {
+      acts.forEach(a => {
+        if (isLeadCategory_(a.category) && !a.primary) {
+          settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Primary vs Secondary', 'Secondary (' + a.name + ')', 'Primary', 'High', 'Goals → Conversions → mark as Primary.'));
         }
-      }
-    } catch(ePmax) {}
-
-    // ====== Account-level items via GAQL where possible ======
-    // A6 ECFL, A7 Call Reporting/Default Call Conversion
-    try {
-      var acct = fetchCustomerSettingsGAQL_(); // {ecflEnabled, callReportingEnabled, callConversionAction}
-      var ecflCur = acct.ecflEnabled ? 'ON' : 'OFF';
-      if (ecflCur !== 'ON') {
-        settingsFindings.push([today, getCid_(), AdsApp.currentAccount().getName(), '', '',
-          'Enhanced Conversions for Leads', ecflCur, 'ON', 'High',
-          'Goals → Settings → Turn on enhanced conversions for leads.'
-        ]);
-      }
-      var callCur = (!acct.callReportingEnabled) ? 'Disabled'
-                 : (!acct.callConversionAction ? 'None' : 'Enabled + Default');
-      if (callCur !== 'Enabled + Default') {
-        settingsFindings.push([today, getCid_(), AdsApp.currentAccount().getName(), '', '',
-          'Call Conversion Action', callCur, 'Enabled + Default', 'High',
-          'Goals → Settings → Call conversion action (select default).'
-        ]);
-      }
-    } catch(eCust) {
-      settingsFindings.push([today, getCid_(), AdsApp.currentAccount().getName(), '', '',
-        'Enhanced Conversions for Leads', 'Unavailable in Scripts', 'ON', 'High',
-        'Goals → Settings → Turn on enhanced conversions for leads.'
-      ]);
-      settingsFindings.push([today, getCid_(), AdsApp.currentAccount().getName(), '', '',
-        'Call Conversion Action', 'Unavailable in Scripts', 'Enabled + Default', 'High',
-        'Goals → Settings → Call conversion action (select default).'
-      ]);
-    }
-
-    // A4/A5 conversions & attribution
-    try {
-      var convs = fetchConversionActionsGAQL_(); // [{name, primary, attribModel, ddaStatus, category}]
-      for (var i = 0; i < convs.length; i++) {
-        var ca = convs[i];
-        if (isLeadCategory_(ca.category) && !ca.primary) {
-          settingsFindings.push([today, getCid_(), AdsApp.currentAccount().getName(), '', '',
-            'Primary vs Secondary', 'Secondary (' + ca.name + ')', 'Primary', 'High',
-            'Goals → Conversions → mark this conversion as Primary.'
-          ]);
+        if (String(a.attrib).toUpperCase() !== 'DATA_DRIVEN') {
+          const sev = ['AVAILABLE','STABLE','LEARNING'].indexOf(String(a.dda).toUpperCase()) >= 0 ? 'Medium' : 'Info';
+          settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Attribution Model', a.attrib + ' (' + a.name + ')', 'DATA_DRIVEN', sev, 'Goals → Conversions → Attribution → Data-driven.'));
         }
-        if (ca.attribModel !== 'DATA_DRIVEN') {
-          var sev = (ca.ddaStatus === 'AVAILABLE' || ca.ddaStatus === 'STABLE' || ca.ddaStatus === 'LEARNING') ? 'Medium' : 'Info';
-          settingsFindings.push([today, getCid_(), AdsApp.currentAccount().getName(), '', '',
-            'Attribution Model', ca.attribModel + ' (' + ca.name + ')', 'DATA_DRIVEN', sev,
-            'Goals → Conversions → Attribution → Data-driven (where eligible).'
-          ]);
-        }
-      }
-    } catch(eCA) {
-      settingsFindings.push([today, getCid_(), AdsApp.currentAccount().getName(), '', '',
-        'Primary vs Secondary', 'Unavailable in Scripts', 'Primary', 'High',
-        'Goals → Conversions → mark each lead conversion as Primary.'
-      ]);
-      settingsFindings.push([today, getCid_(), AdsApp.currentAccount().getName(), '', '',
-        'Attribution Model', 'Unavailable in Scripts', 'DATA_DRIVEN', 'Info',
-        'Goals → Conversions → Attribution → Data-driven (where eligible).'
-      ]);
+      });
+    } else {
+      settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Conversions Read', note || 'No readable conversions', 'Readable', 'Info', 'Ensure MCC can read the conversion customer or use account-level conversions.'));
     }
+  } catch (e) {
+    settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Conversions Read', 'Access/Query Error', 'Readable', 'Info', 'Ensure MCC can read conversion customer.'));
+  }
 
-    // A10 Auto-apply subscriptions
-    try {
-      var subs = fetchAutoApplySubscriptionsGAQL_(); // [{type,status}]
-      for (var j = 0; j < subs.length; j++) {
-        if (subs[j].status !== 'ENABLED') continue;
-        var t = subs[j].type;
-        var name = prettySubscriptionName_(t);
-        var sev = isRiskySubscription_(t) ? 'High' : 'Info';
-        settingsFindings.push([today, getCid_(), AdsApp.currentAccount().getName(), '', '',
-          'Auto-apply Recommendation', '"' + name + '" ON', 'OFF', sev,
-          'Recommendations → Auto-apply → turn OFF.'
-        ]);
+  // Campaign-level: networks, presence, languages, excluded placements
+  try {
+    const camps = listCampaignSettings_(customerId); // [{id,name,channel,search,partners,display,posGeo}]
+    camps.forEach(c => {
+      if (c.channel === 'SEARCH') {
+        // Your latest rule: Search Network must be OFF
+        if (c.search)   settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, c.id, c.name, 'Search Network', 'ON', 'OFF', 'High', 'Campaign → Settings → Networks → uncheck "Search Network".'));
+        if (c.partners) settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, c.id, c.name, 'Search Partners', 'ON', 'OFF', 'High', 'Campaign → Settings → Networks → uncheck "Include Google search partners".'));
+        if (c.display)  settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, c.id, c.name, 'Display Expansion', 'ON', 'OFF', 'High', 'Campaign → Settings → Networks → uncheck "Include Google Display Network".'));
       }
-    } catch(eSub) {
-      settingsFindings.push([today, getCid_(), AdsApp.currentAccount().getName(), '', '',
-        'Auto-apply Recommendation', 'Unavailable in Scripts', 'OFF (for risky items)', 'Info',
-        'Recommendations → Auto-apply → turn OFF risky items: Broad Match, Create new Search campaigns, Automatically created assets, Raise budgets.'
-      ]);
-    }
-
-    // ===== Performance Levers =====
-    var baseline = fetchCampaignTotalsGAQL_(WINDOW_METRICS); // {cid: {name, cost, conv, cpa}}
-
-    // B1: Search vs Search Partners (GAQL; replaces deprecated AdNetworkType1)
-    var partners = fetchPartnersGAQL_(WINDOW_METRICS); // {cid: {name, search:{cost,conv,ctr}, partners:{cost,conv,ctr}}}
-    Object.keys(partners).forEach(function(cid) {
-      var row = partners[cid];
-      var s = row.search || {};
-      var p = row.partners || {};
-      var spendP = toNum_(p.cost);
-      var convP  = toNum_(p.conv);
-      var cpaP   = calcCpa_(p.cost, p.conv);
-      var cpaS   = calcCpa_(s.cost, s.conv);
-      var ctrS   = toNum_(s.ctr);
-      var ctrP   = toNum_(p.ctr);
-
-      var shouldEmit = false;
-      var reason = '';
-      var suggested = 'Turn OFF';
-
-      if (spendP >= PARTNERS_SPEND_ZERO_CONV && convP === 0) {
-        shouldEmit = true; reason = 'High spend zero conv.';
+      if (c.posGeo && String(c.posGeo).toUpperCase() !== 'PRESENCE') {
+        settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, c.id, c.name, 'Location Option', String(c.posGeo), 'PRESENCE', 'High', 'Location options → select "Presence: People in or regularly in your included locations".'));
       }
-      if (!shouldEmit && spendP >= PARTNERS_MIN_SPEND_ALERT && isFinite(cpaS) && cpaS > 0 && isFinite(cpaP) && (cpaP / cpaS) > PARTNERS_CPA_RATIO_LIMIT) {
-        shouldEmit = true; reason = 'CPA high.';
-      }
-      if (!shouldEmit && spendP >= PARTNERS_MIN_SPEND_ALERT && ctrS > 0 && (ctrP / ctrS) < PARTNERS_CTR_RATIO_LIMIT) {
-        shouldEmit = true; reason = 'CTR low.';
-      }
+    });
 
-      if (shouldEmit) {
-        var baseCpa = isFinite(cpaS) ? cpaS : '';
-        leverFindings.push([
-          today, getCid_(), AdsApp.currentAccount().getName(),
-          cid, row.name,
+    const langIssues = listLanguageIssues_(customerId);
+    langIssues.forEach(issue => {
+      settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, issue.campId, issue.campName, 'Language Targeting', issue.current, 'English only', 'Medium', 'Campaign → Additional settings → Languages → set to English.'));
+    });
+
+    const kidPlacements = listExcludedPlacements_(customerId);
+    kidPlacements.forEach(p => {
+      settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, p.campId, p.campName, 'Excluded Placement (Kid-Safety)', p.url, 'Excluded', 'Info', 'Brand safety ✓'));
+    });
+  } catch (e) {
+    settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Campaign Settings', 'Access/Query Error', 'Readable', 'Info', 'Permissions or API limits.'));
+  }
+
+  // Account-level UI-only reminders (not exposed by API)
+  settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Engaged-view conversions', 'Unavailable in API', 'Include (ON)', 'Info', 'Goals → Settings → Enable “Include engaged-view conversions”.'));
+  settingsRows.push(makeSettingsRow_(dateStr, customerId, accountName, '', '', 'Include non-skippable video ad formats', 'Unavailable in API', 'ON', 'Info', 'Goals → Settings → “Include non-skippable video ad formats”.'));
+
+  // Performance levers: partners/device/geo (enabled & not ended)
+  try {
+    const baseline = campaignTotals_(customerId);
+
+    const partners = partnersPerf_(customerId);
+    Object.keys(partners).forEach(cid => {
+      const row = partners[cid];
+      const sCost = row.search?.cost || 0, sConv = row.search?.conv || 0, sClk = row.search?.clk || 0, sImp = row.search?.imp || 0;
+      const pCost = row.partners?.cost || 0, pConv = row.partners?.conv || 0, pClk = row.partners?.clk || 0, pImp = row.partners?.imp || 0;
+      const cpaS = cpa_(sCost, sConv), cpaP = cpa_(pCost, pConv);
+      const ctrS = sImp > 0 ? (sClk/sImp) : 0;
+      const ctrP = pImp > 0 ? (pClk/pImp) : 0;
+
+      const emit =
+        (pCost >= CONFIG.PARTNERS_SPEND_ZERO_CONV && pConv === 0) ||
+        (pCost >= CONFIG.PARTNERS_MIN_SPEND_ALERT && isFinite(cpaS) && cpaS>0 && isFinite(cpaP) && (cpaP/cpaS) > CONFIG.PARTNERS_CPA_RATIO_LIMIT) ||
+        (pCost >= CONFIG.PARTNERS_MIN_SPEND_ALERT && ctrS > 0 && (ctrP/ctrS) < CONFIG.PARTNERS_CTR_RATIO_LIMIT);
+
+      if (emit) {
+        leverRows.push([
+          dateStr, customerId, accountName, cid, row.name,
           'PARTNERS','SEARCH_PARTNERS',
-          round2_(spendP), convP, round2_(cpaP), round2_(baseCpa),
-          deltaPct_(cpaP, baseCpa),
-          suggested, reason
+          round2_(pCost), pConv, round2_(cpaP), round2_(cpaS),
+          deltaPctStr_(cpaP, cpaS), 'Turn OFF',
+          (pConv===0 && pCost>=CONFIG.PARTNERS_SPEND_ZERO_CONV) ? 'High spend zero conv.' :
+          ((isFinite(cpaS)&&isFinite(cpaP)&&(cpaP/cpaS)>CONFIG.PARTNERS_CPA_RATIO_LIMIT) ? 'CPA high.' : 'CTR low.')
         ]);
       }
     });
 
-    // B2: Device (GAQL)
-    var devices = fetchDevicesGAQL_(WINDOW_METRICS); // {cid: {name, rows:[{device,cost,conv,cpa}]}}
-    Object.keys(devices).forEach(function(cid) {
+    const devices = devicePerf_(customerId);
+    Object.keys(devices).forEach(cid => {
       if (!baseline[cid]) return;
-      var base = baseline[cid];
-      var baseCpa = calcCpa_(base.cost, base.conv);
-      if (!isFinite(baseCpa) || baseCpa <= 0) return;
+      const base = baseline[cid];
+      const baseCpa = cpa_(base.cost, base.conv);
+      if (!isFinite(baseCpa) || baseCpa<=0) return;
 
-      devices[cid].rows.forEach(function(d) {
-        var spend = toNum_(d.cost);
-        var devCpa = calcCpa_(d.cost, d.conv);
-
-        if (spend >= DEVGEO_MIN_SPEND && isFinite(devCpa) && devCpa >= 0) {
-          var ratio = devCpa / baseCpa;
-          if (Math.abs(ratio - 1) >= 0.15) {
-            var mod = computeModifier_(ratio);
-            var reason = 'CPA ratio=' + round2_(ratio);
-            leverFindings.push([
-              today, getCid_(), AdsApp.currentAccount().getName(),
-              cid, devices[cid].name,
-              'DEVICE', d.device, round2_(spend), toNum_(d.conv), round2_(devCpa), round2_(baseCpa),
-              deltaPct_(devCpa, baseCpa),
-              mod, reason
-            ]);
-          }
-        } else if (spend >= DEVGEO_MIN_SPEND && toNum_(d.conv) === 0) {
-          var modZero = '-' + Math.round(DEVGEO_MAX_MOD * 100) + '%';
-          leverFindings.push([
-            today, getCid_(), AdsApp.currentAccount().getName(),
-            cid, devices[cid].name,
-            'DEVICE', d.device, round2_(spend), 0, '', round2_(baseCpa),
-            '', modZero, 'Zero-conv with spend'
-          ]);
-        }
-      });
-    });
-
-    // B3: Geo (AWQL GEO_PERFORMANCE_REPORT for readable region names)
-    var geos = fetchGeoRegionsAWQL_(WINDOW_METRICS); // {cid: {name, rows:[{region,cost,conv,cpa}]}}
-    Object.keys(geos).forEach(function(cid) {
-      if (!baseline[cid]) return;
-      var base = baseline[cid];
-      var baseCpa = calcCpa_(base.cost, base.conv);
-      geos[cid].rows.forEach(function(g) {
-        var spend = toNum_(g.cost);
-        var conv  = toNum_(g.conv);
-        var geoLabel = g.region || '(unknown)';
-
-        if (spend >= DEVGEO_MIN_SPEND) {
-          if (conv === 0) {
-            leverFindings.push([
-              today, getCid_(), AdsApp.currentAccount().getName(),
-              cid, geos[cid].name,
-              'GEO', geoLabel, round2_(spend), 0, '', round2_(baseCpa),
-              '', 'Exclude', 'Zero-conv high spend'
-            ]);
-          } else if (isFinite(baseCpa) && baseCpa > 0) {
-            var geoCpa = calcCpa_(g.cost, g.conv);
-            var ratio = geoCpa / baseCpa;
-            if (Math.abs(ratio - 1) >= 0.15) {
-              var modG = computeModifier_(ratio);
-              var reasonG = 'CPA ratio=' + round2_(ratio);
-              leverFindings.push([
-                today, getCid_(), AdsApp.currentAccount().getName(),
-                cid, geos[cid].name,
-                'GEO', geoLabel, round2_(spend), conv, round2_(geoCpa), round2_(baseCpa),
-                deltaPct_(geoCpa, baseCpa),
-                modG, reasonG
-              ]);
+      devices[cid].rows.forEach(d => {
+        if (d.cost >= CONFIG.DEVGEO_MIN_SPEND) {
+          const devCpa = cpa_(d.cost, d.conv);
+          if (d.conv === 0) {
+            leverRows.push([dateStr, customerId, accountName, cid, devices[cid].name, 'DEVICE', d.device,
+              round2_(d.cost), 0, '', round2_(baseCpa), '', '-' + Math.round(CONFIG.DEVGEO_MAX_MOD*100) + '%', 'Zero-conv with spend']);
+          } else if (isFinite(devCpa)) {
+            const ratio = devCpa/baseCpa;
+            if (Math.abs(ratio-1) >= 0.15) {
+              const mod = computeMod_(ratio);
+              leverRows.push([dateStr, customerId, accountName, cid, devices[cid].name, 'DEVICE', d.device,
+                round2_(d.cost), d.conv, round2_(devCpa), round2_(baseCpa), deltaPctStr_(devCpa, baseCpa), mod, 'CPA ratio=' + round2_(ratio)]);
             }
           }
         }
       });
     });
 
-    // ===== Flush rows (append) =====
-    if (settingsFindings.length) {
-      safeAppendSettingsRows_(sheetUrl, settingsFindings);
-      out.findings += settingsFindings.length;
-    }
-    if (leverFindings.length) {
-      safeAppendLeverRows_(sheetUrl, leverFindings);
-      out.findings += leverFindings.length;
-    }
-    out.scanned = 1;
+    const geos = geoPerf_(customerId); // label = location_id
+    Object.keys(geos).forEach(cid => {
+      if (!baseline[cid]) return;
+      const base = baseline[cid];
+      const baseCpa = cpa_(base.cost, base.conv);
+
+      geos[cid].rows.forEach(g => {
+        if (g.cost >= CONFIG.DEVGEO_MIN_SPEND) {
+          if (g.conv === 0) {
+            leverRows.push([dateStr, customerId, accountName, cid, geos[cid].name, 'GEO', g.label,
+              round2_(g.cost), 0, '', round2_(baseCpa), '', 'Exclude', 'Zero-conv high spend']);
+          } else if (isFinite(baseCpa) && baseCpa>0) {
+            const geoCpa = cpa_(g.cost, g.conv);
+            const ratio = geoCpa/baseCpa;
+            if (Math.abs(ratio-1) >= 0.15) {
+              const mod = computeMod_(ratio);
+              leverRows.push([dateStr, customerId, accountName, cid, geos[cid].name, 'GEO', g.label,
+                round2_(g.cost), g.conv, round2_(geoCpa), round2_(baseCpa), deltaPctStr_(geoCpa, baseCpa), mod, 'CPA ratio=' + round2_(ratio)]);
+            }
+          }
+        }
+      });
+    });
 
   } catch (e) {
-    out.errors++;
-    out.reason = stringifyError_(e);
+    // ignore perf errors; settings have been written already
   }
 
-  return JSON.stringify(out);
+  return { settings: settingsRows, levers: leverRows };
 }
 
-/*** ===== PARALLEL COMPLETION (MCC batch) ===== ***/
-function onComplete_(results) {
-  var parsed = [];
-  for (var i = 0; i < results.length; i++) {
-    var r = results[i];
-    if (r.getStatus && r.getStatus() === 'OK') {
-      parsed.push(safeJsonParse_(r.getReturnValue(), { findings:0, errors:1, scanned:0 }));
-    } else {
-      parsed.push({ findings:0, errors:1, scanned:0 });
+/** ====================== GOOGLE ADS API CALLS ====================== **/
+
+function listLeafClients_() {
+  const q = [
+    'SELECT',
+    '  customer_client.client_customer,',
+    '  customer_client.descriptive_name,',
+    '  customer_client.manager',
+    'FROM customer_client',
+    'WHERE customer_client.manager = FALSE'
+  ].join('\n');
+  const batches = gaqlStream_(CONFIG.LOGIN_CUSTOMER_ID, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const out = [];
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const res = r.customerClient || r.customer_client;
+    if (!res) return;
+    const id = String(res.clientCustomer || '').replace('customers/','');
+    const name = String(res.descriptiveName || '');
+    out.push({ customerId: id, name: name });
+  }));
+  return out;
+}
+
+function getConversionCustomer_(customerId) {
+  const q = [
+    'SELECT',
+    '  customer.conversion_tracking_setting.google_ads_conversion_customer',
+    'FROM customer'
+  ].join('\n');
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  for (let i=0;i<batches.length;i++){
+    const arr = batches[i].results || [];
+    for (let j=0;j<arr.length;j++){
+      const row = arr[j];
+      const conv = row.customer?.conversionTrackingSetting?.googleAdsConversionCustomer ||
+                   row.customer?.conversion_tracking_setting?.google_ads_conversion_customer || '';
+      if (conv) return String(conv).replace('customers/','');
     }
   }
-  writeHealthLog_(parsed);
+  return '';
 }
 
-/*** ===== SHEETS HELPERS ===== ***/
-function ensureSheetAndHeader_(ss, sheetName, header) {
-  var sh = ss.getSheetByName(sheetName);
-  if (!sh) {
-    sh = ss.insertSheet(sheetName);
+function getECFLEnabled_(conversionCustomerId) {
+  const q = [
+    'SELECT',
+    '  customer.conversion_tracking_setting.enhanced_conversions_for_leads_enabled',
+    'FROM customer',
+    'LIMIT 1'
+  ].join('\n');
+  const batches = gaqlStream_(conversionCustomerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  for (let i=0;i<batches.length;i++){
+    const arr = batches[i].results || [];
+    for (let j=0;j<arr.length;j++){
+      const row = arr[j];
+      const flag = row.customer?.conversionTrackingSetting?.enhancedConversionsForLeadsEnabled ??
+                   row.customer?.conversion_tracking_setting?.enhanced_conversions_for_leads_enabled;
+      return !!flag;
+    }
   }
-  var rng = sh.getRange(1, 1, 1, header.length);
-  var values = rng.getValues()[0];
-  var needs = false;
-  for (var i = 0; i < header.length; i++) {
-    if (values[i] !== header[i]) { needs = true; break; }
+  return false;
+}
+
+function getCallReporting_(customerId) {
+  const q = [
+    'SELECT',
+    '  customer.call_reporting_setting.call_reporting_enabled,',
+    '  customer.call_reporting_setting.call_conversion_action',
+    'FROM customer',
+    'LIMIT 1'
+  ].join('\n');
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  let enabled = false, actionResName = '';
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const cr = r.customer?.callReportingSetting || r.customer?.call_reporting_setting;
+    if (!cr) return;
+    enabled = !!(cr.callReportingEnabled ?? cr.call_reporting_enabled);
+    actionResName = String((cr.callConversionAction ?? cr.call_conversion_action) || '');
+  }));
+  return { enabled, actionResName };
+}
+
+function listAutoApply_(customerId) {
+  const q = [
+    'SELECT',
+    '  recommendation_subscription.type,',
+    '  recommendation_subscription.status,',
+    '  recommendation_subscription.create_date_time,',
+    '  recommendation_subscription.modify_date_time',
+    'FROM recommendation_subscription'
+  ].join('\n');
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const out = [];
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const s = r.recommendationSubscription || r.recommendation_subscription;
+    if (!s) return;
+    out.push({
+      type: String(s.type || ''),
+      status: String(s.status || '')
+    });
+  }));
+  return out;
+}
+
+function listConversionActions_(conversionCustomerId) {
+  const q = [
+    'SELECT',
+    '  conversion_action.resource_name,',
+    '  conversion_action.name,',
+    '  conversion_action.status,',
+    '  conversion_action.primary_for_goal,',
+    '  conversion_action.attribution_model,',
+    '  conversion_action.data_driven_model_status,',
+    '  conversion_action.category',
+    'FROM conversion_action',
+    "WHERE conversion_action.status = 'ENABLED'"
+  ].join('\n');
+  const batches = gaqlStream_(conversionCustomerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const out = [];
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const ca = r.conversionAction || r.conversion_action;
+    if (!ca) return;
+    out.push({
+      res: String(ca.resourceName || ca.resource_name || ''),
+      name: String(ca.name || ''),
+      primary: !!(ca.primaryForGoal ?? ca.primary_for_goal),
+      attrib: String((ca.attributionModel ?? ca.attribution_model) || ''),
+      dda: String((ca.dataDrivenModelStatus ?? ca.data_driven_model_status) || ''),
+      category: String(ca.category || '')
+    });
+  }));
+  return out;
+}
+
+function getConversionActionByRes_(customerId, resourceName){
+  if (!resourceName) return null;
+  const q = [
+    'SELECT',
+    '  conversion_action.name,',
+    '  conversion_action.status,',
+    '  conversion_action.category',
+    'FROM conversion_action',
+    `WHERE conversion_action.resource_name = '${resourceName}'`,
+    'LIMIT 1'
+  ].join('\n');
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  for (const b of batches) {
+    const arr = b.results || [];
+    for (const r of arr) {
+      const ca = r.conversionAction || r.conversion_action;
+      if (ca) return {
+        name: String(ca.name || ''),
+        status: String(ca.status || ''),
+        category: String(ca.category || '')
+      };
+    }
   }
-  if (needs) {
-    rng.setValues([header]);
-  }
-  return sh;
+  return null;
 }
 
-function safeAppendSettingsRows_(sheetUrl, rows) {
-  var ss = SpreadsheetApp.openByUrl(sheetUrl);
-  var sh = ensureSheetAndHeader_(ss, TAB_SETTINGS, HDR_SETTINGS);
-  appendRows_(sh, rows, HDR_SETTINGS.length);
+/** =================== CAMPAIGN & TARGETING (ENABLED & ACTIVE) =================== **/
+
+function today_() {
+  const tz = Session.getScriptTimeZone() || 'UTC';
+  return Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+}
+function activeDateFilter_() {
+  const t = today_();
+  return `(campaign.end_date >= '${t}' OR campaign.end_date IS NULL)`;
 }
 
-function safeAppendLeverRows_(sheetUrl, rows) {
-  var ss = SpreadsheetApp.openByUrl(sheetUrl);
-  var sh = ensureSheetAndHeader_(ss, TAB_LEVERS, HDR_LEVERS);
-  appendRows_(sh, rows, HDR_LEVERS.length);
+function listCampaignSettings_(customerId) {
+  const q = [
+    'SELECT',
+    '  campaign.id,',
+    '  campaign.name,',
+    '  campaign.advertising_channel_type,',
+    '  campaign.status,',
+    '  campaign.end_date,',
+    '  campaign.network_settings.target_search_network,',
+    '  campaign.network_settings.target_partner_search_network,',
+    '  campaign.network_settings.target_content_network,',
+    '  campaign.geo_target_type_setting.positive_geo_target_type',
+    'FROM campaign',
+    "WHERE campaign.status = 'ENABLED'",
+    `  AND ${activeDateFilter_()}`
+  ].join('\n');
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const out = [];
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const c = r.campaign;
+    if (!c) return;
+    out.push({
+      id: String(c.id),
+      name: String(c.name || ''),
+      channel: String(c.advertisingChannelType || c.advertising_channel_type || ''),
+      search: !!(c.networkSettings?.targetSearchNetwork ?? c.network_settings?.target_search_network),
+      partners: !!(c.networkSettings?.targetPartnerSearchNetwork ?? c.network_settings?.target_partner_search_network),
+      display: !!(c.networkSettings?.targetContentNetwork ?? c.network_settings?.target_content_network),
+      posGeo: String((c.geoTargetTypeSetting?.positiveGeoTargetType ?? c.geo_target_type_setting?.positive_geo_target_type) || '')
+    });
+  }));
+  return out;
 }
 
-function writeHealthLog_(items) {
-  var ss = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
-  var sh = ensureSheetAndHeader_(ss, TAB_HEALTH, HDR_HEALTH);
-  var tz = AdsApp.currentAccount().getTimeZone();
-  var today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
-  var totalAcc = 0, totalFindings = 0, totalErrors = 0;
-  items.forEach(function(r){
-    totalAcc     += (r.scanned  || 0);
-    totalFindings+= (r.findings || 0);
-    totalErrors  += (r.errors   || 0);
+function listLanguageIssues_(customerId) {
+  const q = [
+    'SELECT',
+    '  campaign.id,',
+    '  campaign.name,',
+    '  campaign.end_date,',
+    '  campaign.status,',
+    '  campaign_criterion.type,',
+    '  language_constant.name',
+    'FROM campaign_criterion',
+    "WHERE campaign_criterion.type = 'LANGUAGE'",
+    "  AND campaign.status = 'ENABLED'",
+    `  AND ${activeDateFilter_()}`
+  ].join('\n');
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const map = {}; // cid -> {name, langs:Set}
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const cid = String(r.campaign?.id || '');
+    const cname = String(r.campaign?.name || '');
+    const lname = String((r.languageConstant?.name) || (r.language_constant?.name) || '');
+    if (!map[cid]) map[cid] = { name: cname, langs: new Set() };
+    if (lname) map[cid].langs.add(lname);
+  }));
+  const issues = [];
+  Object.keys(map).forEach(cid => {
+    const langs = Array.from(map[cid].langs);
+    const ok = (langs.length === 1 && langs[0] === 'English');
+    if (!ok) {
+      issues.push({ campId: cid, campName: map[cid].name, current: langs.length ? langs.join(', ') : 'All languages' });
+    }
   });
-  appendRows_(sh, [[today, 'Settings+Signals', totalAcc, totalFindings, totalErrors]], HDR_HEALTH.length);
+  return issues;
+}
+
+function listExcludedPlacements_(customerId) {
+  const q = [
+    'SELECT',
+    '  campaign.id,',
+    '  campaign.name,',
+    '  campaign.status,',
+    '  campaign.end_date,',
+    '  campaign_criterion.type,',
+    '  campaign_criterion.negative,',
+    '  campaign_criterion.placement.url',
+    'FROM campaign_criterion',
+    "WHERE campaign_criterion.type = 'PLACEMENT'",
+    '  AND campaign_criterion.negative = TRUE',
+    "  AND campaign.status = 'ENABLED'",
+    `  AND ${activeDateFilter_()}`
+  ].join('\n');
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const out = [];
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const url = String(r.campaignCriterion?.placement?.url || r.campaign_criterion?.placement?.url || '');
+    if (url && CONFIG.KID_SAFETY_RE.test(url)) {
+      out.push({ campId: String(r.campaign.id), campName: String(r.campaign.name || ''), url });
+    }
+  }));
+  return out;
+}
+
+/** ========================== PERFORMANCE (ENABLED & ACTIVE) ========================== **/
+
+function campaignTotals_(customerId) {
+  const {start, end} = dateRange_(CONFIG.WINDOW_METRICS);
+  const q = [
+    'SELECT',
+    '  campaign.id,',
+    '  campaign.name,',
+    '  campaign.status,',
+    '  campaign.end_date,',
+    '  metrics.cost_micros,',
+    '  metrics.conversions,',
+    '  segments.date',
+    'FROM campaign',
+    "WHERE campaign.status = 'ENABLED'",
+    `  AND ${activeDateFilter_()}`,
+    `  AND segments.date BETWEEN '${start}' AND '${end}'`
+  ].join('\n');
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const map = {};
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const cid = String(r.campaign.id);
+    const name = String(r.campaign.name || '');
+    const cost = microsToCurrency_(r.metrics.costMicros);
+    const conv = num_(r.metrics.conversions);
+    if (!map[cid]) map[cid] = { name, cost:0, conv:0 };
+    map[cid].name = name;
+    map[cid].cost += cost;
+    map[cid].conv += conv;
+  }));
+  return map;
+}
+
+function partnersPerf_(customerId) {
+  const {start, end} = dateRange_(CONFIG.WINDOW_METRICS);
+  const q = [
+    'SELECT',
+    '  campaign.id,',
+    '  campaign.name,',
+    '  campaign.status,',
+    '  campaign.end_date,',
+    '  segments.ad_network_type,',
+    '  metrics.cost_micros,',
+    '  metrics.conversions,',
+    '  metrics.clicks,',
+    '  metrics.impressions',
+    'FROM campaign',
+    "WHERE campaign.status = 'ENABLED'",
+    `  AND ${activeDateFilter_()}`,
+    "  AND campaign.advertising_channel_type = 'SEARCH'",
+    "  AND segments.ad_network_type IN ('GOOGLE_SEARCH','SEARCH_PARTNERS')",
+    `  AND segments.date BETWEEN '${start}' AND '${end}'`
+  ].join('\n');
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const map = {};
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const cid = String(r.campaign.id);
+    const name = String(r.campaign.name || '');
+    const net  = String(r.segments.adNetworkType || r.segments.ad_network_type || '').toUpperCase();
+    const cost = microsToCurrency_(r.metrics.costMicros);
+    const conv = num_(r.metrics.conversions);
+    const clk  = num_(r.metrics.clicks);
+    const imp  = num_(r.metrics.impressions);
+    if (!map[cid]) map[cid] = { name, search:{cost:0,conv:0,clk:0,imp:0}, partners:{cost:0,conv:0,clk:0,imp:0} };
+    const bucket = net.indexOf('PARTNERS')>=0 ? 'partners' : 'search';
+    map[cid][bucket].cost += cost;
+    map[cid][bucket].conv += conv;
+    map[cid][bucket].clk  += clk;
+    map[cid][bucket].imp  += imp;
+  }));
+  return map;
+}
+
+function devicePerf_(customerId) {
+  const {start, end} = dateRange_(CONFIG.WINDOW_METRICS);
+  const q = [
+    'SELECT',
+    '  campaign.id,',
+    '  campaign.name,',
+    '  campaign.status,',
+    '  campaign.end_date,',
+    '  segments.device,',
+    '  metrics.cost_micros,',
+    '  metrics.conversions',
+    'FROM campaign',
+    "WHERE campaign.status = 'ENABLED'",
+    `  AND ${activeDateFilter_()}`,
+    `  AND segments.date BETWEEN '${start}' AND '${end}'`
+  ].join('\n');
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const map = {};
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const cid = String(r.campaign.id);
+    const name = String(r.campaign.name || '');
+    const dev = normalizeDevice_(String(r.segments.device || ''));
+    const cost = microsToCurrency_(r.metrics.costMicros);
+    const conv = num_(r.metrics.conversions);
+    if (!map[cid]) map[cid] = { name, rows:[] };
+    map[cid].rows.push({ device: dev, cost, conv });
+  }));
+  return map;
+}
+
+function geoPerf_(customerId) {
+  // Use segments.location_id as a stable label (no extra lookup)
+  const {start, end} = dateRange_(CONFIG.WINDOW_METRICS);
+  const q = [
+    'SELECT',
+    '  campaign.id,',
+    '  campaign.name,',
+    '  campaign.status,',
+    '  campaign.end_date,',
+    '  segments.location_id,',
+    '  metrics.cost_micros,',
+    '  metrics.conversions',
+    'FROM campaign',
+    "WHERE campaign.status = 'ENABLED'",
+    `  AND ${activeDateFilter_()}`,
+    `  AND segments.date BETWEEN '${start}' AND '${end}'`
+  ].join('\n');
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const map = {};
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const cid = String(r.campaign.id);
+    const name = String(r.campaign.name || '');
+    const loc = String(r.segments.locationId || r.segments.location_id || '(unknown)');
+    const cost = microsToCurrency_(r.metrics.costMicros);
+    const conv = num_(r.metrics.conversions);
+    if (!map[cid]) map[cid] = { name, rows:[] };
+    map[cid].rows.push({ label: loc, cost, conv });
+  }));
+  return map;
+}
+
+/** ============================ HTTP / AUTH ============================ **/
+
+function gaqlStream_(customerId, query, loginId) {
+  const token = getAccessToken_();
+  const url = `https://googleads.googleapis.com/${CONFIG.API_VERSION}/customers/${customerId}/googleAds:searchStream`;
+  const payload = JSON.stringify({ query });
+  const headers = {
+    Authorization: 'Bearer ' + token,
+    'developer-token': CONFIG.DEVELOPER_TOKEN,
+    'login-customer-id': loginId || CONFIG.LOGIN_CUSTOMER_ID,
+    'Content-Type': 'application/json'
+  };
+  const res = UrlFetchApp.fetch(url, { method: 'post', payload, headers, muteHttpExceptions: true });
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+
+  if (code >= 300) {
+    throw new Error('GAQL ' + code + ' :: ' + text);
+  }
+
+  // searchStream can return either a JSON array or NDJSON-style lines.
+  let out;
+  try {
+    out = JSON.parse(text);
+    if (!Array.isArray(out)) out = [out];
+  } catch (e) {
+    out = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean).map(s => {
+      try { return JSON.parse(s); } catch(_){ return {}; }
+    });
+  }
+  return out;
+}
+
+function getAccessToken_() {
+  const props = PropertiesService.getScriptProperties();
+  const now = Date.now();
+  const cached = props.getProperty('ads_access_token');
+  const expStr = props.getProperty('ads_access_token_exp');
+  if (cached && expStr && Number(expStr) > now + 60000) return cached;
+
+  const url = 'https://oauth2.googleapis.com/token';
+  const payload = {
+    client_id: CONFIG.CLIENT_ID,
+    client_secret: CONFIG.CLIENT_SECRET,
+    refresh_token: CONFIG.REFRESH_TOKEN,
+    grant_type: 'refresh_token'
+  };
+  const res = UrlFetchApp.fetch(url, { method: 'post', payload: payload, muteHttpExceptions: true });
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+  if (code >= 300) throw new Error('OAuth token refresh failed ' + code + ' :: ' + text);
+  const json = JSON.parse(text);
+  const token = json.access_token;
+  const expiresIn = Number(json.expires_in || 3600);
+  PropertiesService.getScriptProperties().setProperty('ads_access_token', token);
+  PropertiesService.getScriptProperties().setProperty('ads_access_token_exp', String(Date.now() + (expiresIn*1000)));
+  return token;
+}
+
+/** ============================ SHEETS HELPERS ============================ **/
+
+function ensureSheet_(ss, name, header) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  const range = sh.getRange(1,1,1,header.length);
+  const cur = range.getValues()[0];
+  let needs = false;
+  for (let i=0;i<header.length;i++) if (cur[i] !== header[i]) { needs = true; break; }
+  if (needs) range.setValues([header]);
+  return sh;
 }
 
 function appendRows_(sh, rows, width) {
   if (!rows || !rows.length) return;
-  var startRow = sh.getLastRow() + 1;
-  var data = rows.map(function(r){
-    var arr = r.slice(0, width);
-    while (arr.length < width) arr.push('');
-    return arr;
+  const data = rows.map(r => {
+    const a = r.slice(0,width);
+    while (a.length < width) a.push('');
+    return a;
   });
-  sh.getRange(startRow, 1, data.length, width).setValues(data);
+  const start = sh.getLastRow()+1;
+  sh.getRange(start,1,data.length,width).setValues(data);
 }
 
-/*** ===== GAQL & AWQL HELPERS ===== ***/
-function getDateRange_(windowName) {
-  var tz = AdsApp.currentAccount().getTimeZone();
-  var now = new Date();
-  var end = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
-  var days = 30;
+/** ========================== ROWS & UTILITIES ========================== **/
+
+function makeSettingsRow_(date, cid, acc, campId, campName, check, current, expected, sev, tip) {
+  return [date, cid, acc, String(campId||''), String(campName||''), check, String(current||''), String(expected||''), sev, tip];
+}
+
+function dateRange_(windowName) {
+  const tz = Session.getScriptTimeZone() || 'UTC';
+  const now = new Date();
+  let days = 30;
   if (windowName === 'LAST_7_DAYS') days = 7;
-  var startDate = new Date(now.getTime() - (days-1)*24*60*60*1000);
-  var start = Utilities.formatDate(startDate, tz, 'yyyy-MM-dd');
-  return { start: start, end: end };
+  const end = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
+  const startDate = new Date(now.getTime() - (days-1)*24*60*60*1000);
+  const start = Utilities.formatDate(startDate, tz, 'yyyy-MM-dd');
+  return {start, end};
 }
 
-function fetchCampaignTotalsGAQL_(windowName) {
-  var range = getDateRange_(windowName);
-  var q = [
-    "SELECT",
-    "  campaign.id,",
-    "  campaign.name,",
-    "  metrics.cost_micros,",
-    "  metrics.conversions",
-    "FROM campaign",
-    "WHERE campaign.status = 'ENABLED'",
-    "  AND segments.date BETWEEN '" + range.start + "' AND '" + range.end + "'"
-  ].join("\n");
-
-  var map = {};
-  var it = AdsApp.search(q);
-  while (it.hasNext()) {
-    var row = it.next();
-    var cid  = String(row.campaign.id);
-    var name = row.campaign.name;
-    var cost = microsToCurrency_(row.metrics.costMicros);
-    var conv = toNum_(row.metrics.conversions);
-    map[cid] = { name: name, cost: cost, conv: conv, cpa: calcCpa_(cost, conv) };
-  }
-  return map;
+function num_(x){ const n = Number(x); return isNaN(n)?0:n; }
+function microsToCurrency_(m){ const n = Number(m||0); return Math.round((n/1e6)*100)/100; }
+function round2_(n){ n = Number(n); return isFinite(n)? Math.round(n*100)/100 : ''; }
+function cpa_(cost, conv){ const c = num_(cost), v = num_(conv); return v>0 ? c/v : Infinity; }
+function deltaPctStr_(a,b){ a=num_(a); b=num_(b); if(!isFinite(a)||!isFinite(b)||b===0) return ''; return Math.round(((a - b) / b) * 10000)/100 + '%'; }
+function normalizeDevice_(label) {
+  const L = String(label||'').toUpperCase();
+  if (L.indexOf('DESKTOP')>=0 || L.indexOf('COMPUTER')>=0) return 'DESKTOP';
+  if (L.indexOf('MOBILE')>=0) return 'MOBILE';
+  if (L.indexOf('TABLET')>=0) return 'TABLET';
+  return L||'(unknown)';
+}
+function computeMod_(ratio){
+  const delta = Math.abs(ratio-1);
+  let steps = Math.min(CONFIG.DEVGEO_MAX_MOD, Math.floor(delta/CONFIG.DEVGEO_STEP)*CONFIG.DEVGEO_STEP);
+  if (steps<=0) steps = CONFIG.DEVGEO_STEP;
+  const pct = Math.round(steps*100);
+  return (ratio>1 ? '-' : '+') + pct + '%';
 }
 
-function fetchPartnersGAQL_(windowName) {
-  var range = getDateRange_(windowName);
-  var q = [
-    "SELECT",
-    "  campaign.id,",
-    "  campaign.name,",
-    "  segments.ad_network_type,",
-    "  metrics.cost_micros,",
-    "  metrics.conversions,",
-    "  metrics.clicks,",
-    "  metrics.impressions",
-    "FROM campaign",
-    "WHERE campaign.status = 'ENABLED'",
-    "  AND advertising_channel_type = 'SEARCH'",
-    "  AND segments.ad_network_type IN ('GOOGLE_SEARCH','SEARCH_PARTNERS')",
-    "  AND segments.date BETWEEN '" + range.start + "' AND '" + range.end + "'"
-  ].join("\n");
-
-  var map = {};
-  var it = AdsApp.search(q);
-  while (it.hasNext()) {
-    var row = it.next();
-    var cid   = String(row.campaign.id);
-    var name  = row.campaign.name;
-    var net   = String(row.segments.adNetworkType || '');
-    var cost  = microsToCurrency_(row.metrics.costMicros);
-    var conv  = toNum_(row.metrics.conversions);
-    var clicks= toNum_(row.metrics.clicks);
-    var imps  = toNum_(row.metrics.impressions);
-
-    if (!map[cid]) map[cid] = { name: name, search: {}, partners: {} };
-    var bucket = (net.indexOf('PARTNERS') >= 0) ? 'partners' : 'search';
-    var obj = map[cid][bucket];
-    obj.cost = (obj.cost || 0) + cost;
-    obj.conv = (obj.conv || 0) + conv;
-    obj.clicks = (obj.clicks || 0) + clicks;
-    obj.impressions = (obj.impressions || 0) + imps;
-    map[cid][bucket] = obj;
-  }
-  // Compute CTRs
-  Object.keys(map).forEach(function(cid){
-    ['search','partners'].forEach(function(k){
-      var o = map[cid][k] || {};
-      o.ctr = (o.impressions > 0) ? (o.clicks / o.impressions) : 0;
-      map[cid][k] = o;
-    });
-  });
-  return map;
+function isLeadCategory_(cat) {
+  const C = String(cat||'').toUpperCase();
+  return (C.indexOf('LEAD')>=0 || C.indexOf('CONTACT')>=0 || C.indexOf('REQUEST_QUOTE')>=0 ||
+          C.indexOf('SUBMIT_LEAD_FORM')>=0 || C.indexOf('BOOK_APPOINTMENT')>=0 || C.indexOf('PHONE_CALL')>=0);
 }
 
-function fetchDevicesGAQL_(windowName) {
-  var range = getDateRange_(windowName);
-  var q = [
-    "SELECT",
-    "  campaign.id,",
-    "  campaign.name,",
-    "  segments.device,",
-    "  metrics.cost_micros,",
-    "  metrics.conversions",
-    "FROM campaign",
-    "WHERE campaign.status = 'ENABLED'",
-    "  AND segments.date BETWEEN '" + range.start + "' AND '" + range.end + "'"
-  ].join("\n");
-
-  var map = {};
-  var it = AdsApp.search(q);
-  while (it.hasNext()) {
-    var row = it.next();
-    var cid   = String(row.campaign.id);
-    var name  = row.campaign.name;
-    var dev   = normalizeDeviceGAQL_(String(row.segments.device || ''));
-    var cost  = microsToCurrency_(row.metrics.costMicros);
-    var conv  = toNum_(row.metrics.conversions);
-    var cpa   = calcCpa_(cost, conv);
-
-    if (!map[cid]) map[cid] = { name: name, rows: [] };
-    map[cid].rows.push({ device: dev, cost: cost, conv: conv, cpa: cpa });
-  }
-  return map;
+function isRiskySub_(typeStr){
+  const T = String(typeStr||'').toUpperCase();
+  if (/(BROAD|CREATE.*SEARCH|AUTO.*ASSET|RAISE.*BUDGET)/i.test(T)) return true;
+  // if we don't recognize it, treat as risky so you see it
+  return !/REMOVE_REDUNDANT_KEYWORDS|REMOVE_NON_SERVING_KEYWORDS|OPTIMIZE_AD_ROTATION|USE_OPTIMIZED_AD_ROTATION|UPGRADE_CONVERSION_TRACKING|ADD_STORE_VISITS|REMOVE_CONFLICTING_NEGATIVE_KEYWORDS|BID_MORE_EFFICIENTLY/i.test(T);
 }
 
-function fetchGeoRegionsAWQL_(windowName) {
-  var map = {}; // cid -> {name, rows:[{region,cost,conv,cpa}]}
-  var q = [
-    'SELECT CampaignId, CampaignName, Region, Cost, Conversions',
-    'FROM GEO_PERFORMANCE_REPORT',
-    'WHERE CampaignStatus = ENABLED',
-    'DURING ' + windowName
-  ].join(' ');
-  try {
-    var report = AdsApp.report(q);
-    var it = report.rows();
-    while (it.hasNext()) {
-      var r = it.next();
-      var cid    = r['CampaignId'];
-      var name   = r['CampaignName'];
-      var region = r['Region'];
-      var cost   = parseMoney_(r['Cost']);
-      var conv   = toNum_(r['Conversions']);
-      var cpa    = calcCpa_(cost, conv);
-      if (!map[cid]) map[cid] = { name: name, rows: [] };
-      map[cid].rows.push({ region: region, cost: cost, conv: conv, cpa: cpa });
-    }
-  } catch(e) {}
-  return map;
-}
-
-function fetchCustomerSettingsGAQL_() {
-  var q = [
-    "SELECT",
-    "  customer.conversion_tracking_setting.enhanced_conversions_for_leads_enabled,",
-    "  customer.call_reporting_setting.call_reporting_enabled,",
-    "  customer.call_reporting_setting.call_conversion_action",
-    "FROM customer",
-    "LIMIT 1"
-  ].join("\n");
-  var it = AdsApp.search(q);
-  if (!it.hasNext()) return { ecflEnabled: false, callReportingEnabled: false, callConversionAction: '' };
-  var row = it.next();
-  return {
-    ecflEnabled: !!row.customer.conversionTrackingSetting.enhancedConversionsForLeadsEnabled,
-    callReportingEnabled: !!row.customer.callReportingSetting.callReportingEnabled,
-    callConversionAction: String(row.customer.callReportingSetting.callConversionAction || '')
+function prettySub_(typeStr){
+  const T = String(typeStr || '').toUpperCase();
+  const MAP = {
+    REMOVE_REDUNDANT_KEYWORDS: 'Remove redundant keywords',
+    REMOVE_NON_SERVING_KEYWORDS: 'Remove non-serving keywords',
+    ADD_STORE_VISITS_AS_ACCOUNT_DEFAULT_GOAL: 'Add store visits as an account default goal',
+    OPTIMIZE_AD_ROTATION: 'Use optimized ad rotation',
+    USE_OPTIMIZED_AD_ROTATION: 'Use optimized ad rotation',
+    UPGRADE_CONVERSION_TRACKING: 'Upgrade your conversion tracking',
+    BID_MORE_EFFICIENTLY_WITH_MAXIMIZE_CONVERSIONS: 'Bid with Maximize conversions',
+    BID_MORE_EFFICIENTLY_WITH_MAXIMIZE_CONVERSIONS_TARGET_CPA: 'Bid with Max conv. (tCPA)',
+    REMOVE_CONFLICTING_NEGATIVE_KEYWORDS: 'Remove conflicting negative keywords'
   };
+  return MAP[T] ? MAP[T] : `Unknown (${T})`;
 }
 
-function fetchConversionActionsGAQL_() {
-  var q = [
-    "SELECT",
-    "  conversion_action.name,",
-    "  conversion_action.primary_for_goal,",
-    "  conversion_action.attribution_model,",
-    "  conversion_action.data_driven_model_status,",
-    "  conversion_action.category,",
-    "  conversion_action.status",
-    "FROM conversion_action",
-    "WHERE conversion_action.status = 'ENABLED'"
-  ].join("\n");
+function noDash_(s){ return String(s||'').replace(/-/g,''); }
 
-  var out = [];
-  var it = AdsApp.search(q);
-  while (it.hasNext()) {
-    var row = it.next();
-    out.push({
-      name: row.conversionAction.name,
-      primary: !!row.conversionAction.primaryForGoal,
-      attribModel: String(row.conversionAction.attributionModel || ''),
-      ddaStatus: String(row.conversionAction.dataDrivenModelStatus || ''),
-      category: String(row.conversionAction.category || '')
-    });
+function normalizeSheetUrl_(u){
+  // Keep everything up to '/edit'; strip query/hash to avoid gid conflicts
+  if (!u) return u;
+  const m = String(u).match(/^(https:\/\/docs\.google\.com\/spreadsheets\/d\/[^/]+\/edit)/i);
+  return m ? m[1] : u;
+}
+
+/** =========================== PREFLIGHT / VERSION =========================== **/
+
+function preflight_(){
+  const miss = [];
+  if (!CONFIG.DEVELOPER_TOKEN) miss.push('DEVELOPER_TOKEN');
+  if (!CONFIG.CLIENT_ID) miss.push('CLIENT_ID');
+  if (!CONFIG.CLIENT_SECRET) miss.push('CLIENT_SECRET');
+  if (!CONFIG.REFRESH_TOKEN) miss.push('REFRESH_TOKEN');
+  if (!CONFIG.OUTPUT_SHEET_URL || CONFIG.OUTPUT_SHEET_URL.indexOf('https://docs.google.com/spreadsheets/') !== 0) miss.push('OUTPUT_SHEET_URL');
+  if (miss.length) throw new Error('Missing config: ' + miss.join(', '));
+
+  // Resolve working API version automatically (v21 → v20 → v19 → v18)
+  CONFIG.API_VERSION = resolveApiVersion_(['v21','v20','v19','v18']);
+
+  // Auth probe @ MCC using the resolved version
+  const probe = gaqlStream_(CONFIG.LOGIN_CUSTOMER_ID, 'SELECT customer.id FROM customer LIMIT 1', CONFIG.LOGIN_CUSTOMER_ID);
+  if (!probe || !probe.length) throw new Error('Auth probe returned no data.');
+}
+
+function resolveApiVersion_(candidates) {
+  const token = getAccessToken_();
+  for (var i = 0; i < candidates.length; i++) {
+    const ver = candidates[i];
+    try {
+      const url = `https://googleads.googleapis.com/${ver}/customers/${CONFIG.LOGIN_CUSTOMER_ID}/googleAds:searchStream`;
+      const payload = JSON.stringify({ query: 'SELECT customer.id FROM customer LIMIT 1' });
+      const headers = {
+        Authorization: 'Bearer ' + token,
+        'developer-token': CONFIG.DEVELOPER_TOKEN,
+        'login-customer-id': CONFIG.LOGIN_CUSTOMER_ID,
+        'Content-Type': 'application/json'
+      };
+      const res = UrlFetchApp.fetch(url, { method: 'post', payload, headers, muteHttpExceptions: true });
+      const code = res.getResponseCode();
+      if (code === 404) continue; // version not found; try next
+      // any non-404 means version exists; we’ll handle auth/perm elsewhere
+      return ver;
+    } catch (e) {
+      const msg = String(e);
+      if (msg.indexOf('404') >= 0) continue;
+      return ver;
+    }
   }
-  return out;
+  throw new Error('No supported Google Ads API version found in: ' + candidates.join(', '));
 }
 
-function fetchAutoApplySubscriptionsGAQL_() {
-  var q = [
-    "SELECT",
-    "  recommendation_subscription.type,",
-    "  recommendation_subscription.status",
-    "FROM recommendation_subscription"
-  ].join("\n");
+/** ======================= DEBUG & TOKEN UTILITIES ======================= **/
 
-  var out = [];
-  var it = AdsApp.search(q);
-  while (it.hasNext()) {
-    var row = it.next();
-    out.push({
-      type: String(row.recommendationSubscription.type || ''),
-      status: String(row.recommendationSubscription.status || '')
-    });
-  }
-  return out;
+function resetTokenCache() {
+  const p = PropertiesService.getScriptProperties();
+  p.deleteProperty('ads_access_token');
+  p.deleteProperty('ads_access_token_exp');
+  Logger.log('✅ Cleared token cache.');
 }
 
-/*** ===== UTILS ===== ***/
-function getCid_(){ return AdsApp.currentAccount().getCustomerId().replace(/-/g, ''); }
-function microsToCurrency_(m){ var n = Number(m||0); return Math.round((n/1000000) * 100) / 100; }
-function round2_(n){ n = toNum_(n); return isFinite(n) ? Math.round(n * 100) / 100 : ''; }
-function toNum_(x){ var n = Number(x); return isNaN(n) ? 0 : n; }
-function parseMoney_(s){ if (!s) return 0; var n = parseFloat(String(s).replace(/[^0-9.]+/g, '')); return isNaN(n) ? 0 : n; }
-function calcCpa_(cost, conv){ cost = toNum_(cost); conv = toNum_(conv); return conv > 0 ? (cost / conv) : Infinity; }
-function deltaPct_(a, b){ a = toNum_(a); b = toNum_(b); if (!isFinite(a) || !isFinite(b) || b === 0) return ''; return Math.round(((a - b) / b) * 10000)/100 + '%'; }
-function computeModifier_(ratio){
-  var delta = Math.abs(ratio - 1);
-  var steps = Math.min(DEVGEO_MAX_MOD, Math.floor(delta / DEVGEO_STEP) * DEVGEO_STEP);
-  if (steps <= 0) steps = DEVGEO_STEP;
-  var pct = Math.round(steps * 100);
-  return (ratio > 1 ? '-' : '+') + pct + '%';
-}
-function stringifyError_(e){
-  if (!e) return 'Unknown error';
-  if (e.stack) return e.message + ' :: ' + e.stack;
-  return String(e && e.message || e);
-}
-function safeJsonParse_(s, fallback){
-  try { return JSON.parse(s); } catch(e){ return fallback; }
-}
-function isManagerScope_(){
-  try {
-    if (typeof AdsManagerApp === 'undefined' || !AdsManagerApp.accounts) return false;
-    AdsManagerApp.accounts().get(); // probe
-    return true;
-  } catch(e) { return false; }
-}
-function normalizeDeviceGAQL_(label) {
-  label = String(label || '').toUpperCase();
-  if (label.indexOf('DESKTOP') >= 0 || label.indexOf('COMPUTER') >= 0) return 'DESKTOP';
-  if (label.indexOf('MOBILE') >= 0) return 'MOBILE';
-  if (label.indexOf('TABLET') >= 0) return 'TABLET';
-  return label || '(unknown)';
-}
-function isLeadCategory_(cat){
-  var C = String(cat || '').toUpperCase();
-  return (
-    C.indexOf('LEAD') >= 0 ||
-    C.indexOf('CONTACT') >= 0 ||
-    C.indexOf('REQUEST_QUOTE') >= 0 ||
-    C.indexOf('SUBMIT_LEAD_FORM') >= 0 ||
-    C.indexOf('BOOK_APPOINTMENT') >= 0 ||
-    C.indexOf('PHONE_CALL') >= 0
-  );
-}
-function isRiskySubscription_(typeStr){
-  var t = String(typeStr || '').toUpperCase();
-  return (
-    t.indexOf('BROAD_MATCH') >= 0 ||
-    t.indexOf('AUTO') >= 0 ||
-    t.indexOf('RAISE_BUDGET') >= 0 ||
-    (t.indexOf('CREATE') >= 0 && t.indexOf('SEARCH') >= 0)
-  );
-}
-function prettySubscriptionName_(typeStr){
-  var t = String(typeStr || '');
-  if (t.match(/BROAD_MATCH/i)) return 'Upgrade to Broad match';
-  if (t.match(/RAISE_BUDGET/i)) return 'Raise budgets automatically';
-  if (t.match(/AUTO/i)) return 'Automatically created assets';
-  if (t.match(/CREATE.*SEARCH/i)) return 'Create new Search campaigns';
-  return t;
-}
-
-/*** ===== MCC HELPERS ===== ***/
-function getAllAccountIdsDedup_() {
-  var sel = AdsManagerApp.accounts();
-  if (MCC_ACCOUNT_LABEL_FILTERS && MCC_ACCOUNT_LABEL_FILTERS.length) {
-    var quoted = MCC_ACCOUNT_LABEL_FILTERS.map(function(s){ return "'" + s.replace(/'/g, "\\'") + "'"; }).join(', ');
-    sel = sel.withCondition("LabelNames CONTAINS_ANY [" + quoted + "]");
-  }
-  var seen = {};
-  var ids = [];
-  var it = sel.get();
-  while (it.hasNext()) {
-    var id = it.next().getCustomerId(); // keep dashes for withIds()
-    if (!seen[id]) { seen[id] = true; ids.push(id); }
-  }
-  return ids;
-}
-
-/*** ===== ROW BUILDER ===== ***/
-function makeSettingsRow_(date, cInfo, checkName, currentVal, expectedVal, severity, fixTip){
-  return [
-    date, getCid_(), AdsApp.currentAccount().getName(),
-    cInfo.id || '', cInfo.name || '',
-    checkName, currentVal, expectedVal, severity, fixTip
-  ];
+// Sanity check: does the token we mint from CONFIG list your MCC?
+function debug_listAccessibleCustomers() {
+  const token = getAccessToken_();
+  const url = `https://googleads.googleapis.com/${CONFIG.API_VERSION}/customers:listAccessibleCustomers`;
+  const res = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: {
+      Authorization: 'Bearer ' + token,
+      'developer-token': CONFIG.DEVELOPER_TOKEN
+    },
+    muteHttpExceptions: true
+  });
+  Logger.log('HTTP %s\n%s', res.getResponseCode(), res.getContentText());
 }
