@@ -16,7 +16,7 @@ const CONFIG = {
   // Google Ads MCC (no dashes)
   LOGIN_CUSTOMER_ID: '9684986590',
 
-  // ---- API creds (sample placeholders from our dev sandbox) ----
+  // ---- API creds (sample placeholders from dev sandbox) ----
   DEVELOPER_TOKEN:   'AdjR3yEAQDH206kqe7N5kg',
   CLIENT_ID:         '759464769302-cdsueuf69ro8jnmmupl7mfj0pceqaa64.apps.googleusercontent.com',
   CLIENT_SECRET:     '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',
@@ -150,6 +150,8 @@ function runNexusAudit() {
           // Call reporting & default call action
           try {
             const callCfg = getCallReporting_(c.customerId); // {enabled, reporting, actionResName}
+            Logger.log('🔎 %s default call action: %s', c.customerId, callCfg.actionResName || '(none)');
+
             if (!callCfg.enabled) {
               findings++;
               appendRows_(shSettings, [[today, c.customerId, c.name, '', '',
@@ -184,10 +186,22 @@ function runNexusAudit() {
                     'Goals → Conversions → Default must be a Call-type action']], CONFIG.HDR_SETTINGS.length);
                 }
               } else {
+                // Explain *why* details aren’t accessible
+                const ownerCid = parseOwnerCidFromRes_(callCfg.actionResName);
+                const inTree = isUnderManagerTree_(ownerCid);
+                const current =
+                  ownerCid
+                    ? (inTree
+                        ? `Default set (owner=${ownerCid}, no row returned)`
+                        : `Default set (owner outside MCC: ${ownerCid})`)
+                    : 'Default set (owner unknown)';
+
                 findings++;
                 appendRows_(shSettings, [[today, c.customerId, c.name, '', '',
-                  'Call Conversion Action', 'Default set (details not accessible)', 'CALL-type & ENABLED', 'Info',
-                  'Open Goals → Conversions and confirm default is a Call-type action']], CONFIG.HDR_SETTINGS.length);
+                  'Call Conversion Action', current, 'CALL-type & ENABLED', 'Info',
+                  'If owner is outside your MCC, request access or recreate a Call-type default in this account']], CONFIG.HDR_SETTINGS.length);
+
+                Logger.log('ℹ️ Default call action ownerCid=%s inTree=%s', ownerCid || '(n/a)', inTree);
               }
             }
           } catch(e){ logClientErrorRow_(shSettings, today, c, 'Call Reporting / Default Call', e); }
@@ -220,6 +234,7 @@ function runNexusAudit() {
     });
   } catch (e) {
     errors++;
+    appendRows_(shHealth, [[today, 'Settings+Signals(API)', scanned, findings, errors]], CONFIG.HDR_HEALTH.length);
     appendRows_(shSettings, [[today, CONFIG.LOGIN_CUSTOMER_ID, 'MCC Worker Error', '', '',
       'Global Error', String(e), '—', 'High', 'Check credentials']], CONFIG.HDR_SETTINGS.length);
   }
@@ -353,9 +368,9 @@ function listLanguageIssues_(customerId) {
   const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
   batches.forEach(b => (b.results||[]).forEach(r => {
     const cid = String(r.campaign?.id || '');
-    const lc  = String(r.campaignCriterion?.language?.languageConstant ||
+    theLc  = String(r.campaignCriterion?.language?.languageConstant ||
                        r.campaign_criterion?.language?.language_constant || '');
-    if (byId[cid] && lc) byId[cid].langs.add(lc);
+    if (byId[cid] && theLc) byId[cid].langs.add(theLc);
   }));
 
   const langMap = getLanguageNameMap_(customerId);
@@ -535,12 +550,51 @@ function listConversionActions_(conversionCustomerId) {
   }
 }
 
-function getConversionActionByRes_(anyCustomerId, resourceName){
+// ---------- NEW HELPERS TO EXPLAIN "DETAILS NOT ACCESSIBLE" ----------
+function parseOwnerCidFromRes_(resourceName){
+  const m = String(resourceName || '').match(/^customers\/(\d+)\/conversionActions\/\d+$/i);
+  return m ? m[1] : '';
+}
+
+function isUnderManagerTree_(ownerCid) {
+  if (!ownerCid) return false;
+  const q = `
+    SELECT customer_client.client_customer
+    FROM customer_client
+    WHERE customer_client.client_customer = 'customers/${ownerCid}'
+    LIMIT 1`;
+  try {
+    const batches = gaqlStream_(CONFIG.LOGIN_CUSTOMER_ID, q, CONFIG.LOGIN_CUSTOMER_ID);
+    for (const b of batches) if ((b.results || []).length) return true;
+  } catch (e) {
+    Logger.log('⚠️ isUnderManagerTree_ check failed for %s: %s', ownerCid, String(e).slice(0,180));
+  }
+  return false;
+}
+// ---------------------------------------------------------------------
+
+function getConversionActionByRes_(clientCid, resourceName){
   if (!resourceName) return null;
 
-  // Extract true owner customer ID from the resource name: customers/{owner}/conversionActions/{id}
-  const m = String(resourceName).match(/^customers\/(\d+)\/conversionActions\/\d+$/);
-  const ownerCid = m ? m[1] : anyCustomerId; // fallback if pattern fails
+  // Parse true owner from "customers/{owner}/conversionActions/{id}"
+  const m = String(resourceName).match(/^customers\/(\d+)\/conversionActions\/\d+$/i);
+  const ownerCid = m ? m[1] : '';
+
+  // Conversion customer (shared conversions hub) may differ from owner/client
+  let convCust = '';
+  try { convCust = getConversionCustomer_(clientCid) || ''; } catch(_) {}
+
+  // Build unique try list: owner → convCust → client
+  const tryList = [];
+  const seen = new Set();
+  const pushTry = (cid, tag) => {
+    if (!cid || seen.has(cid)) return;
+    seen.add(cid);
+    tryList.push({ cid, tag });
+  };
+  pushTry(ownerCid, 'ownerCid');
+  pushTry(convCust, 'convCust');
+  pushTry(clientCid, 'client');
 
   const q = [
     'SELECT',
@@ -553,26 +607,31 @@ function getConversionActionByRes_(anyCustomerId, resourceName){
     `WHERE conversion_action.resource_name = '${resourceName}'`,
     'LIMIT 1'
   ].join('\n');
-  try {
-    // Query the owner account (this fixes “details not accessible” false negatives)
-    const batches = gaqlStream_(ownerCid, q, CONFIG.LOGIN_CUSTOMER_ID);
-    for (const b of batches) {
-      const arr = b.results || [];
-      for (const r of arr) {
-        const ca = r.conversionAction || r.conversion_action;
-        if (ca) return {
-          name: String(ca.name || ''),
-          status: String(ca.status || ''),
-          category: String(ca.category || ''),
-          type: String(ca.type || ''),
-          primary_for_goal: !!(ca.primaryForGoal ?? ca.primary_for_goal)
-        };
+
+  for (const t of tryList) {
+    try {
+      const batches = gaqlStream_(t.cid, q, CONFIG.LOGIN_CUSTOMER_ID);
+      for (const b of batches) {
+        const arr = b.results || [];
+        if (!arr.length) continue;
+        const caRow = arr[0].conversionAction || arr[0].conversion_action;
+        if (caRow) {
+          Logger.log('✅ Resolved default Call Action via %s (cid=%s): %s', t.tag, t.cid, caRow.name);
+          return {
+            name: String(caRow.name || ''),
+            status: String(caRow.status || ''),
+            category: String(caRow.category || ''),
+            type: String(caRow.type || ''),
+            primary_for_goal: !!(caRow.primaryForGoal ?? caRow.primary_for_goal)
+          };
+        }
       }
+      Logger.log('ℹ️ No rows for default Call Action via %s (cid=%s)', t.tag, t.cid);
+    } catch (e) {
+      Logger.log('❌ getConversionActionByRes_ via %s (cid=%s) failed: %s', t.tag, t.cid, String(e).slice(0,180));
     }
-  } catch(e){
-    Logger.log("❌ getConversionActionByRes_ failed for ownerCid=%s :: %s", ownerCid, e);
   }
-  return null;
+  return null; // fall back to "details not accessible"
 }
 
 /** =================== GAQL WRAPPER WITH DEBUG =================== **/
