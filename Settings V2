@@ -1,0 +1,335 @@
+/*************************************************************
+ * NEXUS — Settings + Signals Auditor (Apps Script, Google Ads API)
+ * Runs from Google Sheets → Extensions → Apps Script.
+ * Checks: Networks (Search/Partners/Display Expansion), Location Option (Presence),
+ * Language Targeting (flags only non-English or All languages).
+ * Logs to: Settings_Audit, NEXUS_Engine_Health_Log
+ **************************************************************/
+
+/** ================= HARD-CODED CONFIG (LIVE — HANDLE WITH CARE) ================= **/
+const CONFIG = {
+  // Google Ads MCC (no dashes)
+  LOGIN_CUSTOMER_ID: '9684986590',
+
+  // ---- Your API creds (rotated) ----
+  DEVELOPER_TOKEN:   'AdjR3yEAQDH206kqe7N5kg',
+  CLIENT_ID:         '759464769302-cdsueuf69ro8jnmmupl7mfj0pceqaa64.apps.googleusercontent.com',
+  CLIENT_SECRET:     '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',
+  REFRESH_TOKEN:     '1//04ft7GM30EMFsCgYIARAAGAQSNwF-L9IrHrF9ohKw9gJyXX7GSvEv1JH0f6kSoU6DhZaKum6-odIY9mkq1LrGpJNzBxvTUwNDZCA',
+
+  // Output sheet (gid URL ok; we normalize to /edit)
+  OUTPUT_SHEET_URL:  'https://docs.google.com/spreadsheets/d/1VjU6Rs_44TeXtyXmLJriA9TosTcgA_H3bCT7-ZXk-F4/edit?gid=983095729#gid=983095729',
+
+  // API version
+  API_VERSION: 'v21',
+
+  // Tabs & headers
+  TAB_SETTINGS: 'Settings_Audit',
+  TAB_HEALTH:   'NEXUS_Engine_Health_Log',
+  HDR_SETTINGS: ['Date','Customer ID','Account','Campaign ID','Campaign','Check','Current','Expected','Severity','Fix Tip'],
+  HDR_HEALTH:   ['Date','Module','Accounts Scanned','Findings Count','Errors']
+};
+/** ============================================================================ **/
+
+/** =============================== ENTRY =============================== **/
+function runNexusAudit() {
+  const started = new Date();
+  const tz = Session.getScriptTimeZone() || 'UTC';
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+
+  const ss = SpreadsheetApp.openByUrl(normalizeSheetUrl_(CONFIG.OUTPUT_SHEET_URL));
+  const shSettings = ensureSheet_(ss, CONFIG.TAB_SETTINGS, CONFIG.HDR_SETTINGS);
+  const shHealth   = ensureSheet_(ss, CONFIG.TAB_HEALTH,   CONFIG.HDR_HEALTH);
+
+  let findings = 0, errors = 0, scanned = 0;
+
+  try {
+    const clients = listAllChildAccounts_();
+    clients.forEach(c => {
+      try {
+        // === Campaign settings (SEARCH only) ===
+        const settings = listCampaignSettings_(c.customerId);
+        settings.forEach(s => {
+          if (s.search) {
+            findings++;
+            appendRows_(shSettings, [[today, c.customerId, c.name, s.id, s.name,
+              'Search Network', 'ON', 'OFF', 'High',
+              'Campaign → Settings → Networks → uncheck "Search Network".']], CONFIG.HDR_SETTINGS.length);
+          }
+          if (s.partners) {
+            findings++;
+            appendRows_(shSettings, [[today, c.customerId, c.name, s.id, s.name,
+              'Search Partners', 'ON', 'OFF', 'High',
+              'Campaign → Settings → Networks → uncheck "Search partners".']], CONFIG.HDR_SETTINGS.length);
+          }
+          if (s.display) {
+            findings++;
+            appendRows_(shSettings, [[today, c.customerId, c.name, s.id, s.name,
+              'Display Expansion', 'ON', 'OFF', 'High',
+              'Campaign → Settings → Networks → uncheck "Display Expansion".']], CONFIG.HDR_SETTINGS.length);
+          }
+          if (s.posGeo && String(s.posGeo).toUpperCase() !== 'PRESENCE') {
+            findings++;
+            appendRows_(shSettings, [[today, c.customerId, c.name, s.id, s.name,
+              'Location Option', s.posGeo, 'PRESENCE', 'High',
+              'Campaign → Settings → Location options → set to Presence only']], CONFIG.HDR_SETTINGS.length);
+          }
+        });
+
+        // === Language targeting (flag only if not English OR All languages) ===
+        const langIssues = listLanguageIssues_(c.customerId);
+        langIssues.forEach(l => {
+          findings++;
+          appendRows_(shSettings, [[today, c.customerId, c.name, l.campId, l.campName,
+            'Language Targeting', l.current, 'English only', 'Medium',
+            'Campaign → Settings → Languages → set to English only']], CONFIG.HDR_SETTINGS.length);
+        });
+
+        scanned++;
+      } catch (e) {
+        errors++;
+        appendRows_(shSettings, [[today, c.customerId, c.name, '', '',
+          'Client Audit Error', String(e), '—', 'High', 'Check API access/permissions.']], CONFIG.HDR_SETTINGS.length);
+      }
+    });
+  } catch (e) {
+    errors++;
+    appendRows_(shSettings, [[today, CONFIG.LOGIN_CUSTOMER_ID, 'MCC Worker Error', '', '',
+      'Global Error', String(e), '—', 'High', 'Check credentials']], CONFIG.HDR_SETTINGS.length);
+  }
+
+  appendRows_(shHealth, [[today, 'Settings+Signals(API)', scanned, findings, errors]], CONFIG.HDR_HEALTH.length);
+  Logger.log('Done. accounts=%s findings=%s errors=%s in %s sec',
+             scanned, findings, errors, Math.round((new Date() - started)/1000));
+}
+
+/** =================== CHILD ACCOUNT ENUMERATOR =================== **/
+function listAllChildAccounts_() {
+  const q = [
+    'SELECT',
+    '  customer_client.client_customer,',
+    '  customer_client.descriptive_name,',
+    '  customer_client.manager',
+    'FROM customer_client',
+    'WHERE customer_client.manager = FALSE'
+  ].join('\n');
+  const batches = gaqlStream_(CONFIG.LOGIN_CUSTOMER_ID, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const out = [];
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const res = r.customerClient || r.customer_client;
+    if (!res) return;
+    const id = String(res.clientCustomer || '').replace('customers/','');
+    const name = String(res.descriptiveName || '');
+    out.push({ customerId: id, name: name });
+  }));
+  return out;
+}
+
+/** =================== CAMPAIGN SETTINGS (SEARCH only) =================== **/
+function listCampaignSettings_(customerId) {
+  // NOTE: No end_date filter — GAQL WHERE with IS NULL/parens can error.
+  const q = [
+    'SELECT',
+    '  campaign.id,',
+    '  campaign.name,',
+    '  campaign.advertising_channel_type,',
+    '  campaign.status,',
+    '  campaign.network_settings.target_search_network,',
+    '  campaign.network_settings.target_partner_search_network,',
+    '  campaign.network_settings.target_content_network,',
+    '  campaign.geo_target_type_setting.positive_geo_target_type',
+    'FROM campaign',
+    "WHERE campaign.status = 'ENABLED'",
+    "  AND campaign.advertising_channel_type = 'SEARCH'"
+  ].join('\n');
+
+  try {
+    const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+    const out = [];
+    batches.forEach(b => (b.results||[]).forEach(r => {
+      const c = r.campaign;
+      if (!c) return;
+      out.push({
+        id: String(c.id),
+        name: String(c.name || ''),
+        channel: String(c.advertisingChannelType || c.advertising_channel_type || ''),
+        search: !!(c.networkSettings?.targetSearchNetwork ?? c.network_settings?.target_search_network),
+        partners: !!(c.networkSettings?.targetPartnerSearchNetwork ?? c.network_settings?.target_partner_search_network),
+        display: !!(c.networkSettings?.targetContentNetwork ?? c.network_settings?.target_content_network),
+        posGeo: String((c.geoTargetTypeSetting?.positiveGeoTargetType ?? c.geo_target_type_setting?.positive_geo_target_type) || '')
+      });
+    }));
+    return out;
+  } catch (e) {
+    Logger.log("❌ Query failed for listCampaignSettings_ cust=%s :: %s", customerId, e);
+    return [];
+  }
+}
+
+/** =================== LANGUAGE UTILITIES =================== **/
+// 1) Get enabled SEARCH campaigns (so language scan is scoped correctly)
+function listSearchCampaigns_(customerId) {
+  const q = [
+    'SELECT',
+    '  campaign.id,',
+    '  campaign.name',
+    'FROM campaign',
+    "WHERE campaign.status = 'ENABLED'",
+    "  AND campaign.advertising_channel_type = 'SEARCH'"
+  ].join('\n');
+
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const out = [];           // [{id, name}]
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const c = r.campaign;
+    if (c) out.push({ id: String(c.id), name: String(c.name || '') });
+  }));
+  return out;
+}
+
+// 2) Build a map of languageConstant resource_name → readable name (English, Spanish, …)
+function getLanguageNameMap_(customerId) {
+  const q = [
+    'SELECT',
+    '  language_constant.resource_name,',
+    '  language_constant.name',
+    'FROM language_constant'
+  ].join('\n');
+
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  const map = {};
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const rn = String(r.languageConstant?.resourceName || r.language_constant?.resource_name || '');
+    const name = String(r.languageConstant?.name || r.language_constant?.name || '');
+    if (rn) map[rn] = name || rn;
+  }));
+  // Ensure English is known even if the table is restricted for some reason
+  if (!map['languageConstants/1000']) map['languageConstants/1000'] = 'English';
+  return map;
+}
+
+// 3) Final language issue detector: only report if non-English or All languages
+function listLanguageIssues_(customerId) {
+  const campaigns = listSearchCampaigns_(customerId); // [{id,name}]
+  const byId = {};
+  campaigns.forEach(c => byId[c.id] = { name: c.name, langs: new Set() });
+
+  // Pull language criteria (resource names)
+  const q = [
+    'SELECT',
+    '  campaign.id,',
+    '  campaign_criterion.language.language_constant',
+    'FROM campaign_criterion',
+    "WHERE campaign_criterion.type = 'LANGUAGE'"
+  ].join('\n');
+
+  const batches = gaqlStream_(customerId, q, CONFIG.LOGIN_CUSTOMER_ID);
+  batches.forEach(b => (b.results||[]).forEach(r => {
+    const cid = String(r.campaign?.id || '');
+    const lc  = String(r.campaignCriterion?.language?.languageConstant ||
+                       r.campaign_criterion?.language?.language_constant || '');
+    if (byId[cid]) {
+      if (lc) byId[cid].langs.add(lc);
+    }
+  }));
+
+  // Map IDs → human names
+  const langMap = getLanguageNameMap_(customerId);
+  const toName = (res) => langMap[res] || res;
+
+  // Build issues
+  const issues = [];
+  Object.keys(byId).forEach(cid => {
+    const rec = byId[cid];
+    const langIds = Array.from(rec.langs);
+    if (langIds.length === 0) {
+      // No language criteria => All languages (flag)
+      issues.push({ campId: cid, campName: rec.name, current: 'All languages' });
+      return;
+    }
+    const names = langIds.map(toName);
+    const onlyEnglish = (names.length === 1 && /english/i.test(names[0]));
+    if (!onlyEnglish) {
+      issues.push({ campId: cid, campName: rec.name, current: names.join(', ') });
+    }
+  });
+
+  return issues;
+}
+
+/** =================== GAQL WRAPPER WITH DEBUG =================== **/
+function gaqlStream_(customerId, query, loginId) {
+  const token = getAccessToken_();
+  const url = `https://googleads.googleapis.com/${CONFIG.API_VERSION}/customers/${customerId}/googleAds:searchStream`;
+  const payload = JSON.stringify({ query });
+  const headers = {
+    Authorization: 'Bearer ' + token,
+    'developer-token': CONFIG.DEVELOPER_TOKEN,
+    'login-customer-id': loginId || CONFIG.LOGIN_CUSTOMER_ID,
+    'Content-Type': 'application/json'
+  };
+  const res = UrlFetchApp.fetch(url, { method: 'post', payload, headers, muteHttpExceptions: true });
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+  if (code >= 300) {
+    Logger.log("❌ GAQL FAILED for cust=%s :: HTTP %s\nQuery=\n%s\nResponse=%s", customerId, code, query, text);
+    throw new Error('GAQL ' + code + ' :: ' + text);
+  }
+  let out;
+  try {
+    out = JSON.parse(text);
+    if (!Array.isArray(out)) out = [out];
+  } catch (e) {
+    out = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean).map(s => {
+      try { return JSON.parse(s); } catch(_){ return {}; }
+    });
+  }
+  return out;
+}
+
+/** =================== AUTH =================== **/
+function getAccessToken_() {
+  const url = 'https://oauth2.googleapis.com/token';
+  const payload = {
+    client_id: CONFIG.CLIENT_ID,
+    client_secret: CONFIG.CLIENT_SECRET,
+    refresh_token: CONFIG.REFRESH_TOKEN,
+    grant_type: 'refresh_token'
+  };
+  const res = UrlFetchApp.fetch(url, { method: 'post', payload: payload, muteHttpExceptions: true });
+  const code = res.getResponseCode();
+  const text = res.getContentText();
+  if (code >= 300) throw new Error('OAuth token refresh failed ' + code + ' :: ' + text);
+  const json = JSON.parse(text);
+  return json.access_token;
+}
+
+/** =================== SHEETS HELPERS =================== **/
+function ensureSheet_(ss, name, header) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  const range = sh.getRange(1,1,1,header.length);
+  const cur = range.getValues()[0];
+  let needs = false;
+  for (let i=0;i<header.length;i++) if (cur[i] !== header[i]) { needs = true; break; }
+  if (needs) range.setValues([header]);
+  return sh;
+}
+
+function appendRows_(sh, rows, width) {
+  if (!rows || !rows.length) return;
+  const data = rows.map(r => {
+    const a = r.slice(0,width);
+    while (a.length < width) a.push('');
+    return a;
+  });
+  const start = sh.getLastRow()+1;
+  sh.getRange(start,1,data.length,width).setValues(data);
+}
+
+/** =================== MISC =================== **/
+function normalizeSheetUrl_(u){
+  if (!u) return u;
+  const m = String(u).match(/^(https:\/\/docs\.google\.com\/spreadsheets\/d\/[^/]+\/edit)/i);
+  return m ? m[1] : u;
+}
