@@ -1,0 +1,386 @@
+/**
+ * Turbo Maxx – Ad Copy Performance Audit (GAQL version)
+ * - Scans ALL MCC child accounts.
+ * - Picks only “active” accounts: any ENABLED campaign spent >= $1.00 (account currency) on the previous day.
+ *   (This is ONLY for choosing accounts; all metrics remain last 45 days ending yesterday.)
+ * - Reports ENABLED ads in ENABLED ad groups/campaigns over the last 45 days (ending yesterday).
+ * - Writes to Sheet ID 1VjU6Rs_44TeXtyXmLJriA9TosTcgA_H3bCT7-ZXk-F4, tab "AdCopies" (overwrites).
+ * - IDs are written as strings; ID columns formatted as Plain text.
+ */
+
+function main() {
+  var DEBUG = true;
+  var OVERWRITE_OUTPUT = true;
+
+  // Thresholds / rules
+  var MIN_SPEND_45D = 1.00;          // per-ad 45D spend guard (currency)
+  var MIN_IMPR = 1000;               // for LOW_CTR evaluation
+  var LOW_CTR_BP = 300;              // 3.00%
+  var HIGH_CTR_BP = 500;             // 5.00%
+  var NO_CONV_MIN_CLICKS = 20;
+  var NO_CONV_MIN_COST = 25;         // currency
+  var HIGH_CPA_FACTOR = 1.5;
+
+  // Sheets
+  var OUTPUT_SHEET_ID = "1VjU6Rs_44TeXtyXmLJriA9TosTcgA_H3bCT7-ZXk-F4";
+  var OUTPUT_TAB = "AdCopies";
+
+  // Dealer mapping
+  var DEALER_SHEET_ID = "18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg";
+  var DEALER_TAB = "Dealer Master";
+
+  // Active account detection (previous calendar day)
+  var ACTIVE_PREV_DAY_THRESHOLD = 1.00; // currency
+
+  // Prep
+  var dealerMap = loadDealerMap_(DEALER_SHEET_ID, DEALER_TAB);
+  var ss = SpreadsheetApp.openById(OUTPUT_SHEET_ID);
+  var sheet = ss.getSheetByName(OUTPUT_TAB) || ss.insertSheet(OUTPUT_TAB);
+  if (OVERWRITE_OUTPUT) sheet.clear();
+
+  var header = [
+    "run_date",
+    "account_id",
+    "dealer_name",
+    "campaign_id",
+    "campaign_name",
+    "ad_group_id",
+    "ad_group_name",
+    "ad_id",
+    "ad_type",
+    "headline_sample",
+    "description_sample",
+    "impr_45d",
+    "clicks_45d",
+    "ctr_bp_45d",
+    "conv_45d",
+    "cvr_bp_45d",
+    "cost_45d",
+    "cpa_45d",
+    "target_cpa",
+    "reason_flagged",
+    "notes"
+  ];
+  sheet.getRange(1, 1, 1, header.length).setValues([header]);
+
+  var allRows = [];
+  var acctIter = MccApp.accounts().get();
+
+  while (acctIter.hasNext()) {
+    var account = acctIter.next();
+    MccApp.select(account);
+
+    var tz = AdsApp.currentAccount().getTimeZone();
+    var runDate = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+    var win = buildDateWindow_(tz); // {start:'yyyyMMdd', end:'yyyyMMdd', startDashed:'yyyy-MM-dd', endDashed:'yyyy-MM-dd'}
+
+    // Active-only selection (previous day)
+    if (!isAccountActiveOnDateGAQL_(win.endDashed, ACTIVE_PREV_DAY_THRESHOLD)) {
+      if (DEBUG) Logger.log("Account %s skipped (inactive on %s)", normalizeId_(AdsApp.currentAccount().getCustomerId()), win.end);
+      continue;
+    }
+
+    var accountIdDigits = normalizeId_(AdsApp.currentAccount().getCustomerId());
+    var dealerInfo = dealerMap[accountIdDigits] || { name: "", targetCpa: null };
+
+    // Pull ENABLED ads in ENABLED ad groups/campaigns for last 45 days (ending yesterday)
+    // NOTE: We DO NOT include segments.date in SELECT so results are aggregated over the date range.
+    var gaql = [
+      "SELECT",
+      "  campaign.id, campaign.name,",
+      "  ad_group.id, ad_group.name,",
+      "  ad_group_ad.ad.id,",
+      "  ad_group_ad.ad.type,",
+      "  ad_group_ad.ad.text_ad.headline,",
+      "  ad_group_ad.ad.expanded_text_ad.headline_part1,",
+      "  ad_group_ad.ad.expanded_text_ad.description,",
+      "  ad_group_ad.ad.responsive_search_ad.headlines,",
+      "  ad_group_ad.ad.responsive_search_ad.descriptions,",
+      "  metrics.impressions,",
+      "  metrics.clicks,",
+      "  metrics.cost_micros,",
+      "  metrics.conversions",
+      "FROM ad_group_ad",
+      "WHERE campaign.status = 'ENABLED'",
+      "  AND ad_group.status = 'ENABLED'",
+      "  AND ad_group_ad.status = 'ENABLED'",
+      "  AND segments.date BETWEEN '" + win.startDashed + "' AND '" + win.endDashed + "'"
+    ].join(" ");
+
+    var counters = { processed: 0, written: 0, LOW_CTR: 0, NO_CONV: 0, HIGH_CPA: 0, HIGH_CTR: 0 };
+    var results = AdsApp.search(gaql);
+
+    for (var row of results) {
+      counters.processed++;
+
+      var campaignId = String(row.campaign.id || "");
+      var campaignName = String(row.campaign.name || "");
+      var adGroupId = String(row.adGroup.id || "");
+      var adGroupName = String(row.adGroup.name || "");
+      var adId = String(row.adGroupAd.ad.id || "");
+      var adType = String(row.adGroupAd.ad.type || "");
+
+      // Try to get ad text samples from GAQL row first
+      var headlineSample = "";
+      var descriptionSample = "";
+
+      // Text Ad
+      if (row.adGroupAd.ad.textAd && row.adGroupAd.ad.textAd.headline) {
+        headlineSample = String(row.adGroupAd.ad.textAd.headline);
+      }
+      // Expanded Text Ad
+      if (row.adGroupAd.ad.expandedTextAd) {
+        if (!headlineSample && row.adGroupAd.ad.expandedTextAd.headlinePart1) {
+          headlineSample = String(row.adGroupAd.ad.expandedTextAd.headlinePart1);
+        }
+        if (row.adGroupAd.ad.expandedTextAd.description) {
+          descriptionSample = String(row.adGroupAd.ad.expandedTextAd.description);
+        }
+      }
+      // RSA
+      if (row.adGroupAd.ad.responsiveSearchAd) {
+        try {
+          var hs = row.adGroupAd.ad.responsiveSearchAd.headlines || [];
+          if (!headlineSample && hs.length > 0) {
+            headlineSample = String((hs[0].text != null) ? hs[0].text : hs[0]);
+          }
+          var ds = row.adGroupAd.ad.responsiveSearchAd.descriptions || [];
+          if (!descriptionSample && ds.length > 0) {
+            descriptionSample = String((ds[0].text != null) ? ds[0].text : ds[0]);
+          }
+        } catch (e) {}
+      }
+
+      // If still blank, fallback to entity fetch (best-effort)
+      if (!headlineSample || !descriptionSample) {
+        var samples = fetchAdTextSamples_(adGroupId, adId);
+        if (!headlineSample && samples.headline) headlineSample = samples.headline;
+        if (!descriptionSample && samples.description) descriptionSample = samples.description;
+      }
+
+      var impr = toInt_(row.metrics.impressions);
+      var clicks = toInt_(row.metrics.clicks);
+      var cost = (parseFloat(row.metrics.costMicros) || 0) / 1000000.0; // convert micros -> currency
+      var conv = toFloat_(row.metrics.conversions);
+
+      // Spend guard for the 45D window
+      if (cost < MIN_SPEND_45D) continue;
+
+      var ctr_bp = impr > 0 ? Math.round((clicks / impr) * 10000) : 0;
+      var cvr_bp = clicks > 0 ? Math.round((conv / clicks) * 10000) : 0;
+      var cpa = conv > 0 ? Number((cost / conv).toFixed(2)) : "";
+
+      var reasons = [];
+      if (impr >= MIN_IMPR && ctr_bp < LOW_CTR_BP) {
+        reasons.push("LOW_CTR");
+        counters.LOW_CTR++;
+      }
+      if (conv === 0 && (clicks >= NO_CONV_MIN_CLICKS || cost >= NO_CONV_MIN_COST)) {
+        reasons.push("NO_CONV");
+        counters.NO_CONV++;
+      }
+      if (
+        conv >= 5 &&
+        dealerInfo.targetCpa != null &&
+        dealerInfo.targetCpa !== "" &&
+        !isNaN(dealerInfo.targetCpa) &&
+        cpa !== "" &&
+        (cpa >= dealerInfo.targetCpa * HIGH_CPA_FACTOR)
+      ) {
+        reasons.push("HIGH_CPA");
+        counters.HIGH_CPA++;
+      }
+      if (ctr_bp >= HIGH_CTR_BP && conv >= 1) {
+        reasons.push("HIGH_CTR");
+        counters.HIGH_CTR++;
+      }
+
+      var rowOut = [
+        runDate,
+        accountIdDigits,
+        dealerInfo.name || "",
+        campaignId,
+        campaignName,
+        adGroupId,
+        adGroupName,
+        adId,
+        adType,
+        headlineSample,
+        descriptionSample,
+        impr,
+        clicks,
+        ctr_bp,
+        conv,
+        cvr_bp,
+        Number(cost.toFixed(2)),
+        cpa,
+        dealerInfo.targetCpa != null && dealerInfo.targetCpa !== "" ? Number(Number(dealerInfo.targetCpa).toFixed(2)) : "",
+        reasons.join("|"),
+        ""
+      ];
+
+      allRows.push(rowOut);
+      counters.written++;
+    }
+
+    if (DEBUG) {
+      Logger.log(
+        "Account %s processed=%s written=%s LOW_CTR=%s NO_CONV=%s HIGH_CPA=%s HIGH_CTR=%s",
+        accountIdDigits,
+        counters.processed,
+        counters.written,
+        counters.LOW_CTR,
+        counters.NO_CONV,
+        counters.HIGH_CPA,
+        counters.HIGH_CTR
+      );
+    }
+  }
+
+  // Write
+  if (allRows.length > 0) {
+    sheet.getRange(2, 1, allRows.length, header.length).setValues(allRows);
+  }
+
+  // Force plain text for ID columns
+  var lastRow = sheet.getLastRow();
+  if (lastRow >= 2) {
+    sheet.getRange(2, 2, lastRow - 1, 1).setNumberFormat("@"); // account_id
+    sheet.getRange(2, 4, lastRow - 1, 1).setNumberFormat("@"); // campaign_id
+    sheet.getRange(2, 6, lastRow - 1, 1).setNumberFormat("@"); // ad_group_id
+    sheet.getRange(2, 8, lastRow - 1, 1).setNumberFormat("@"); // ad_id
+  }
+}
+
+/** Build 45D window ending yesterday; returns both compact and dashed formats. */
+function buildDateWindow_(tz) {
+  var now = new Date();
+  var y = new Date(now.getFullYear(), now.getMonth(), now.getDate()); // today 00:00
+  y = new Date(y.getTime() - 24 * 3600 * 1000); // yesterday
+  var start = new Date(y.getTime() - 44 * 24 * 3600 * 1000); // inclusive 45D
+
+  var startYmd = Utilities.formatDate(start, tz, "yyyyMMdd");
+  var endYmd = Utilities.formatDate(y, tz, "yyyyMMdd");
+  var startDashed = Utilities.formatDate(start, tz, "yyyy-MM-dd");
+  var endDashed = Utilities.formatDate(y, tz, "yyyy-MM-dd");
+
+  return { start: startYmd, end: endYmd, startDashed: startDashed, endDashed: endDashed };
+}
+
+/** GAQL-based active check: any ENABLED campaign cost >= threshold on the given date. */
+function isAccountActiveOnDateGAQL_(yyyy_mm_dd, thresholdCurrency) {
+  var micros = Math.round(thresholdCurrency * 1000000);
+  var q = [
+    "SELECT campaign.id, metrics.cost_micros",
+    "FROM campaign",
+    "WHERE campaign.status = 'ENABLED'",
+    "  AND metrics.cost_micros > " + micros,
+    "  AND segments.date BETWEEN '" + yyyy_mm_dd + "' AND '" + yyyy_mm_dd + "'"
+  ].join(" ");
+  var it = AdsApp.search(q);
+  return it.hasNext();
+}
+
+/** Dealer map from Dealer Master (case-insensitive columns; digits-only Account Id). */
+function loadDealerMap_(sheetId, tabName) {
+  var map = {};
+  try {
+    var sh = SpreadsheetApp.openById(sheetId).getSheetByName(tabName);
+    if (!sh) return map;
+
+    var data = sh.getDataRange().getValues();
+    if (data.length < 2) return map;
+
+    var header = data[0].map(function (h) { return String(h).toLowerCase().trim(); });
+    var idxId = header.findIndex(function (h) { return h.indexOf("google") > -1 && h.indexOf("account") > -1 && h.indexOf("id") > -1; });
+    var idxName = header.findIndex(function (h) { return h.indexOf("dealer") > -1 && h.indexOf("name") > -1; });
+    var idxTarget = header.findIndex(function (h) { return h.indexOf("target") > -1 && h.indexOf("cpa") > -1; });
+
+    for (var i = 1; i < data.length; i++) {
+      var row = data[i];
+      var accRaw = idxId > -1 ? String(row[idxId]) : "";
+      var accId = normalizeId_(accRaw);
+      if (!accId) continue;
+
+      var name = idxName > -1 ? String(row[idxName]) : "";
+      var target = idxTarget > -1 ? row[idxTarget] : "";
+      var targetNum = (target === "" || target == null) ? null : Number(target);
+
+      map[accId] = { name: name, targetCpa: isFinite(targetNum) ? targetNum : null };
+    }
+  } catch (e) {}
+  return map;
+}
+
+/** Normalize to digits-only. */
+function normalizeId_(s) {
+  return String(s || "").replace(/[^\d]/g, "");
+}
+
+/** Safe int parse. */
+function toInt_(v) {
+  var n = parseInt(v, 10);
+  return isNaN(n) ? 0 : n;
+}
+
+/** Safe float parse. */
+function toFloat_(v) {
+  var n = parseFloat(v);
+  return isNaN(n) ? 0 : n;
+}
+
+/**
+ * Best-effort fallback to pull ad text via entity API (RSA/ETA/Text), if GAQL row lacks it.
+ * We keep this lightweight and resilient.
+ */
+function fetchAdTextSamples_(adGroupId, adId) {
+  var res = { headline: "", description: "" };
+  try {
+    var agIt = AdsApp.adGroups().withIds([Number(adGroupId)]).get();
+    if (!agIt.hasNext()) return res;
+
+    var ag = agIt.next();
+    var adIt = ag.ads().withCondition("Id = " + adId).get();
+    if (!adIt.hasNext()) return res;
+
+    var ad = adIt.next();
+    var t = ad.getType();
+
+    if (t === "RESPONSIVE_SEARCH_AD") {
+      try {
+        var rsa = ad.asType().responsiveSearchAd();
+        if (rsa && rsa.getHeadlines) {
+          var hs = rsa.getHeadlines();
+          if (hs && hs.length > 0) res.headline = hs[0].getText ? hs[0].getText() : String(hs[0]);
+        }
+        if (rsa && rsa.getDescriptions) {
+          var ds = rsa.getDescriptions();
+          if (ds && ds.length > 0) res.description = ds[0].getText ? ds[0].getText() : String(ds[0]);
+        }
+      } catch (e) {}
+    } else if (t === "EXPANDED_TEXT_AD") {
+      try {
+        var eta = ad.asType().expandedTextAd();
+        if (eta && eta.getHeadlinePart1) res.headline = eta.getHeadlinePart1();
+        if (eta && eta.getDescription1 && eta.getDescription2) {
+          var d1 = eta.getDescription1();
+          var d2 = eta.getDescription2();
+          res.description = d2 ? (d1 + " | " + d2) : d1;
+        } else if (eta && eta.getDescription) {
+          res.description = eta.getDescription();
+        }
+      } catch (e) {}
+    } else if (t === "TEXT_AD") {
+      try {
+        var ta = ad.asType().textAd();
+        if (ta && ta.getHeadline) res.headline = ta.getHeadline();
+        if (ta && ta.getDescription1 && ta.getDescription2) {
+          var td1 = ta.getDescription1();
+          var td2 = ta.getDescription2();
+          res.description = td2 ? (td1 + " | " + td2) : td1;
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return res;
+}
