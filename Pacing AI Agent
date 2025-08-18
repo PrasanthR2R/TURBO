@@ -1,0 +1,342 @@
+/***** NEXUS TURBO — AI Pacing Engine (All Dealers) v5
+ * Changes in v5:
+ * - Scans ALL dealers (no 5-dealer cap).
+ * - Batch OpenAI calls (fetchAll in chunks) for speed/limits.
+ * - LLM writes the final storytelling reason line (reason_line_story) — no text composed in code.
+ * - Fixed header/row misalignment: preserve input header order when writing output.
+ * - Safer mapping: key suggestions by account_id|campaign_id to avoid collisions.
+ * - Validation hardened (non-negative budget, enums, etc.).
+ ************************************************************/
+
+const INPUT_SPREADSHEET_ID  = '1VjU6Rs_44TeXtyXmLJriA9TosTcgA_H3bCT7-ZXk-F4';
+const INPUT_GID             = 607051763;
+const OUTPUT_SPREADSHEET_ID = '1Wzp2xIALbxzl33stMU5kmczIntTVWc1dl-8vaIsJoRc';
+const OUTPUT_GID            = 0;
+
+const OPENAI_MODEL = 'gpt-4o-mini';
+const OPENAI_URL   = 'https://api.openai.com/v1/chat/completions';
+
+const TEMPERATURE  = 0.2;
+// Tune if you have lots of dealers; 6–10 is a good range for Apps Script execution time.
+const FETCH_BATCH_SIZE = 8;
+
+const REQUIRED_HEADERS = [
+  'run_date','row_type','account_id','dealer_name','category','campaign_id','campaign_name',
+  'budget_source','shared_budget_id','current_daily_budget','monthly_budget','mtd_spend',
+  'avg_daily_last7','remaining_days','needed_daily','gap_bp','pacing_status',
+  'impr_45d','clicks_45d','ctr_bp_45d','conv_45d','cvr_bp_45d','cost_45d',
+  'lost_is_budget_bp','limited_by_budget_flag','top_campaigns_json','eligible_for_push','notes'
+];
+
+const OUTPUT_EXTRA_COLS = ['ai_daily_budget_suggestion','ai_reason'];
+
+/** Menu */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('NEXUS Turbo AI')
+    .addItem('Run AI Pacing (All Dealers)', 'runAIPacingAllDealers')
+    .addToUi();
+}
+
+/** Entry: All Dealers */
+function runAIPacingAllDealers() {
+  const inputSS  = SpreadsheetApp.openById(INPUT_SPREADSHEET_ID);
+  const inputSh  = getSheetByGid_(inputSS, INPUT_GID);
+  const outputSS = SpreadsheetApp.openById(OUTPUT_SPREADSHEET_ID);
+  const outputSh = getSheetByGid_(outputSS, OUTPUT_GID);
+
+  if (!inputSh) throw new Error('Input sheet not found by gid.');
+  if (!outputSh) throw new Error('Output sheet not found by gid.');
+
+  const data = inputSh.getDataRange().getValues();
+  if (!data || data.length < 2) throw new Error('No data rows found in input.');
+
+  const header = data[0];
+  validateHeaders_(header);
+
+  const rows = data.slice(1).map(r => asObj_(header, r));
+  const allDealers = getAllDealers_(rows);
+  if (allDealers.length === 0) throw new Error('No dealers found.');
+
+  const dealerPayloads = buildDealerPayloads_(rows, allDealers);
+
+  const apiKey = getOpenAIKey_();
+
+  // ==== Batch OpenAI calls in chunks ====
+  const allSuggestions = [];
+  for (let i = 0; i < dealerPayloads.length; i += FETCH_BATCH_SIZE) {
+    const chunk = dealerPayloads.slice(i, i + FETCH_BATCH_SIZE);
+    const requests = chunk.map(payload => ({
+      url: OPENAI_URL,
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + apiKey },
+      payload: JSON.stringify(buildOpenAIBody_(payload)),
+      muteHttpExceptions: true
+    }));
+
+    const responses = UrlFetchApp.fetchAll(requests);
+
+    responses.forEach((res, idx) => {
+      const payload = chunk[idx];
+      const code = res.getResponseCode();
+      if (code < 200 || code >= 300) {
+        Logger.log('OpenAI error: ' + code + ' ' + res.getContentText());
+        return;
+      }
+      const body = safeJson_(res.getContentText());
+      const content = body?.choices?.[0]?.message?.content || '';
+      const parsed = safeJson_(content) || tryExtractJson_(content);
+      if (!parsed || !Array.isArray(parsed.campaign_suggestions)) return;
+
+      parsed.campaign_suggestions.forEach(s => {
+        if (validateLLMRow_(s)) {
+          allSuggestions.push({
+            dealer_name: payload.dealer_name,
+            account_id: s.account_id,
+            campaign_id: s.campaign_id,
+            suggested_daily_budget: s.suggested_daily_budget,
+            reason_line_story: s.reason_line_story
+          });
+        }
+      });
+    });
+  }
+
+  // Write output: ONLY the LLM-provided suggestion + story line
+  writeOutput_(outputSh, header, rows, allSuggestions);
+}
+
+/** Build per-dealer payload with category budgets + campaigns (includes account_id) */
+function buildDealerPayloads_(allRows, dealers) {
+  const byDealer = {};
+  dealers.forEach(d => byDealer[d] = { dealer_name: d, categories: {} });
+
+  for (const row of allRows) {
+    const d = (row['dealer_name'] || '').toString();
+    if (!byDealer[d]) continue;
+
+    const category = (row['category'] || '').toString();
+    const rowType  = (row['row_type'] || '').toString().toUpperCase();
+
+    if (!byDealer[d].categories[category]) {
+      byDealer[d].categories[category] = {
+        category,
+        monthly_budget: null,
+        remaining_days: null,
+        campaigns: []
+      };
+    }
+
+    if (rowType === 'CATEGORY') {
+      const mb = toNumberSafe_(row['monthly_budget']);
+      const rd = toNumberSafe_(row['remaining_days']);
+      if (mb != null) byDealer[d].categories[category].monthly_budget = mb;
+      if (rd != null) byDealer[d].categories[category].remaining_days = rd;
+    } else if (rowType === 'CAMPAIGN') {
+      byDealer[d].categories[category].campaigns.push({
+        account_id: (row['account_id'] || '').toString(),
+        campaign_id: (row['campaign_id'] || '').toString(),
+        campaign_name: (row['campaign_name'] || '').toString(),
+        current_daily_budget: toNumberSafe_(row['current_daily_budget']),
+        mtd_spend: toNumberSafe_(row['mtd_spend']),
+        avg_daily_last7: toNumberSafe_(row['avg_daily_last7']),
+        impr_45d: toNumberSafe_(row['impr_45d']),
+        clicks_45d: toNumberSafe_(row['clicks_45d']),
+        ctr_bp_45d: toNumberSafe_(row['ctr_bp_45d']),
+        conv_45d: toNumberSafe_(row['conv_45d']),
+        cvr_bp_45d: toNumberSafe_(row['cvr_bp_45d']),
+        cost_45d: toNumberSafe_(row['cost_45d']),
+        budget_source: (row['budget_source'] || '').toString(),
+        pacing_status: (row['pacing_status'] || '').toString(),
+        eligible_for_push: (row['eligible_for_push'] || '').toString(),
+      });
+    }
+  }
+
+  return Object.values(byDealer).map(d => ({
+    dealer_name: d.dealer_name,
+    categories: Object.values(d.categories)
+  }));
+}
+
+/** Strict system + user body: LLM computes budgets and writes final storytelling line */
+function buildOpenAIBody_(dealerPayload) {
+  const systemPrompt =
+`You are "NEXUS Turbo AI", an expert Google Ads budget pacer.
+Input is ONE dealer with categories and campaigns.
+Your job: compute a DAILY budget per campaign and WRITE the final storytelling line.
+
+HARD rules:
+- Budgets exist at category level (monthly_budget on CATEGORY rows). Campaign rows don't have monthly_budget.
+- Use monthly_budget, remaining_days, and each campaign's mtd_spend.
+- Heavily weigh recent signals: avg_daily_last7, impr_45d, clicks_45d, ctr_bp_45d, conv_45d, cvr_bp_45d, cost_45d.
+- If remaining_days > 0, the SUM of suggested campaign budgets in a category MUST NOT exceed:
+  max(0, (monthly_budget - SUM(mtd_spend of campaigns in that category)) / remaining_days).
+- If monthly_budget is missing or remaining_days <= 0, default to current_daily_budget.
+- No negative budgets.
+- KEEP OUTPUT SHORT & CONSISTENT.
+
+For EVERY campaign, YOU must compute and output:
+- account_id (string echo)
+- campaign_id (string echo)
+- suggested_daily_budget (number)
+- change_direction ("Increase" | "Decrease" | "Maintain") — must match the numeric change vs current_daily_budget
+- change_percent (integer 0..200) — percentage change vs current_daily_budget. If maintaining, 0.
+
+STORY LINE (STRICT) — write this as the only line we'll store:
+- Field name: reason_line_story
+- Use past tense action: "Increased" | "Decreased" | "Maintained"
+- If Increased/Decreased: include the percent like "Increased 50%".
+- If Maintained: omit percent entirely.
+- Format: <Action> [<percent>%] — <cause>; <budget logic>; <expected impact>
+- Keep ≤ 120 characters, no emojis.
+- <cause>: pick 1–2 drivers: "conversions up", "CTR rising", "CVR above baseline", "no conversions", "high CPA", "low volume", "limited by budget", "stable CVR".
+- <budget logic>: e.g., "within daily cap", "avoid overspend", "use remaining headroom", "steady pace".
+- <expected impact>: e.g., "capture demand", "reduce waste", "protect ROAS", "scale winners".
+- Examples:
+  - Increased 50% — conversions up; within daily cap; capture demand
+  - Increased 30% — CTR rising; use remaining headroom; scale winners
+  - Decreased 40% — high CPA; avoid overspend; reduce waste
+  - Maintained — stable CVR; steady pace; protect ROAS
+
+STRICT JSON ONLY (no markdown). Output:
+{
+  "dealer_name": "<dealer>",
+  "campaign_suggestions": [
+    {
+      "account_id": "<id>",
+      "campaign_id": "<id>",
+      "suggested_daily_budget": <number>,
+      "change_direction": "Increase|Decrease|Maintain",
+      "change_percent": <integer>,
+      "reason_line_story": "Increased 50% — conversions up; within daily cap; capture demand"
+    }
+  ]
+}`;
+
+  const userPrompt = {
+    instruction: "Compute AI-only daily budgets under the rules above and include reason_line_story. JSON only.",
+    dealer: dealerPayload
+  };
+
+  return {
+    model: OPENAI_MODEL,
+    temperature: TEMPERATURE,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: JSON.stringify(userPrompt) }
+    ]
+  };
+}
+
+/** Output — ONLY LLM-written values are used for AI columns */
+function writeOutput_(sheet, header, inputRows, suggestions) {
+  // Map: account_id|campaign_id → { budget, reason }
+  const sugByKey = {};
+  suggestions.forEach(s => {
+    const acc = (s.account_id || '').toString();
+    const cid = (s.campaign_id || '').toString();
+    if (!acc || !cid) return;
+    const key = `${acc}|${cid}`;
+    sugByKey[key] = {
+      ai_daily_budget_suggestion: s.suggested_daily_budget,
+      ai_reason: s.reason_line_story
+    };
+  });
+
+  // Build header in the SAME order as input, then append extras
+  const outHeader = header.slice();
+  OUTPUT_EXTRA_COLS.forEach(c => outHeader.push(c));
+
+  // Build rows following the same header order
+  const outRows = inputRows.map(row => {
+    const base = header.map(h => row[h]); // preserve input order
+
+    let extra1 = '', extra2 = '';
+    if ((row['row_type'] || '').toString().toUpperCase() === 'CAMPAIGN') {
+      const acc = (row['account_id'] || '').toString();
+      const cid = (row['campaign_id'] || '').toString();
+      const key = `${acc}|${cid}`;
+      if (sugByKey[key]) {
+        extra1 = sugByKey[key].ai_daily_budget_suggestion;
+        extra2 = sugByKey[key].ai_reason;
+      }
+    }
+    base.push(extra1, extra2);
+    return base;
+  });
+
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, outHeader.length).setValues([outHeader]);
+  if (outRows.length > 0) {
+    sheet.getRange(2, 1, outRows.length, outHeader.length).setValues(outRows);
+  }
+}
+
+/** Helpers */
+function getOpenAIKey_() {
+  const key = PropertiesService.getScriptProperties().getProperty('OPENAI_API_KEY');
+  if (!key) throw new Error('Missing OPENAI_API_KEY in Script properties.');
+  return key.trim();
+}
+
+function getSheetByGid_(ss, gid) {
+  const sheets = ss.getSheets();
+  for (const sh of sheets) if (sh.getSheetId && sh.getSheetId() === gid) return sh;
+  return null;
+}
+
+function validateHeaders_(header) {
+  const missing = REQUIRED_HEADERS.filter(h => header.indexOf(h) === -1);
+  if (missing.length) throw new Error('Input sheet missing required headers: ' + missing.join(', '));
+}
+
+function asObj_(header, row) {
+  const obj = {};
+  for (let i = 0; i < header.length; i++) obj[header[i]] = row[i];
+  return obj;
+}
+
+function getAllDealers_(rows) {
+  const seen = new Set(); const order = [];
+  for (const r of rows) {
+    const d = (r['dealer_name'] || '').toString();
+    if (!d) continue;
+    if (!seen.has(d)) { seen.add(d); order.push(d); }
+  }
+  return order;
+}
+
+function toNumberSafe_(v) {
+  if (v === null || v === '' || typeof v === 'undefined') return null;
+  const num = Number(v);
+  return isNaN(num) ? null : num;
+}
+
+function tryExtractJson_(txt) {
+  if (!txt) return null;
+  const start = txt.indexOf('{');
+  const end = txt.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try { return JSON.parse(txt.substring(start, end + 1)); } catch (e) { return null; }
+}
+
+function safeJson_(t) {
+  try { return JSON.parse(t); } catch(e) { return null; }
+}
+
+/** Validate LLM row without doing any math */
+function validateLLMRow_(s) {
+  if (!s) return false;
+  const acc = typeof s.account_id === 'string' && s.account_id.trim().length > 0;
+  const cid = typeof s.campaign_id === 'string' && s.campaign_id.trim().length > 0;
+  const bud = typeof s.suggested_daily_budget === 'number'
+              && isFinite(s.suggested_daily_budget)
+              && s.suggested_daily_budget >= 0; // non-negative guard
+  const dirOk = typeof s.change_direction === 'string' && /^(Increase|Decrease|Maintain)$/i.test(s.change_direction || '');
+  const pctOk = Number.isInteger(s.change_percent) && s.change_percent >= 0 && s.change_percent <= 200;
+  const story = typeof s.reason_line_story === 'string' && s.reason_line_story.trim().length > 0 && s.reason_line_story.length <= 200; // generous cap
+  return acc && cid && bud && dirOk && pctOk && story;
+}
