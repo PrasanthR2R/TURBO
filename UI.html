@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Turbo Ops — UI</title>
+
+  <!-- Fonts + Tailwind -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            brand: {50:'#F5F7FF',100:'#E9EEFF',200:'#D5DEFF',300:'#B8C5FF',400:'#8EA5FF',500:'#5E81FF',600:'#3E63FF',700:'#2E4BD9',800:'#233AA8',900:'#1F338C'}
+          },
+          boxShadow:{ soft:'0 12px 28px rgba(2,6,23,.08)', lift:'0 14px 40px rgba(2,6,23,.12)' },
+          fontFamily:{ inter:['Inter','ui-sans-serif','system-ui'] }
+        }
+      }
+    }
+  </script>
+
+  <style>
+    html,body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+    /* Background image — full bleed, no overlay */
+    body{
+      background-image:url("https://iamzara.live/wp-content/uploads/2025/03/Metallic-Hologram-Texture-Wallpaper-Set-4.jpg");
+      background-size:cover; background-repeat:no-repeat; background-position:center center;
+      color:#E6EAF2;
+      min-height:100vh;
+    }
+    /* ---- PATCH: tiles look ---- */
+
+
+/* 1) Remove center “hotspot” tint entirely */
+.tile::after,
+.card::after {
+  content: none !important;
+}
+
+/* 2) Base state: NO outer glow */
+.tile::before,
+.card::before {
+  opacity: 0 !important;
+  transition: opacity .18s ease, filter .18s ease, transform .18s ease;
+}
+
+/* 3) Hover: show the 4-side glow */
+.tile:hover::before,
+.card:hover::before {
+  opacity: 1 !important;
+}
+
+/* 4) Keep the edge colors per tile */
+.tile--dealer::before { box-shadow: 0 0 0 1px rgba(59,130,246,.35), 0 0 28px 8px rgba(59,130,246,.18); }   /* blue */
+.tile--team::before   { box-shadow: 0 0 0 1px rgba(16,185,129,.35), 0 0 28px 8px rgba(16,185,129,.18); }   /* green */
+.tile--turbo::before  { box-shadow: 0 0 0 1px rgba(245,158,11,.35), 0 0 28px 8px rgba(245,158,11,.18); }   /* amber */
+
+
+    /* Routes */
+    .route{display:none;opacity:0;transform:translateY(4px);transition:opacity .18s ease,transform .18s ease}
+    .route.active{display:block;opacity:1;transform:none}
+
+    /* Header (dark glass) */
+    .glass-top{
+      background:linear-gradient(180deg,rgba(9,12,20,.78),rgba(9,12,20,.68));
+      backdrop-filter:saturate(120%) blur(10px);
+      -webkit-backdrop-filter:saturate(120%) blur(10px);
+      border-bottom:1px solid rgba(255,255,255,.06);
+    }
+    .navbtn{border-radius:.6rem;padding:.45rem .8rem;font-weight:600;color:#E7ECF7}
+    .navbtn:hover{background:rgba(255,255,255,.08)}
+    .navbtn.active{background:#0E1F55;color:#fff;border:1px solid rgba(255,255,255,.22)}
+
+    /* Gradient headline like Gemini */
+    .gemini-grad{
+      background:linear-gradient(90deg,#7aa0ff 0%,#b68cff 60%,#ff9ed1 100%);
+      -webkit-background-clip:text;background-clip:text;color:transparent
+    }
+
+    /* KPI chips in header */
+    .chip{display:inline-flex;align-items:center;gap:.45rem;padding:.35rem .6rem;border-radius:.6rem;font-size:.85rem;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08)}
+    .chip svg{opacity:.9}
+
+    /* TILES — glass + full halo glow on all 4 sides */
+    .tile{
+      position:relative; isolation:isolate; overflow:visible; /* allow glow around edges */
+      border-radius:1.25rem;
+      border:1px solid rgba(255,255,255,.08);
+      background:var(--tile-bg,linear-gradient(180deg,rgba(17,20,30,.75),rgba(12,14,22,.68)));
+      box-shadow:
+        0 0 0 1px rgba(255,255,255,.06) inset,
+        0 0 22px 0 var(--tile-glow,rgba(94,129,255,.28));  /* uniform outer glow */
+      transition:transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+    }
+    /* Uniform halo ring outside the card — shows on ALL sides */
+    .tile::before{
+      content:""; position:absolute; inset:-10px; z-index:-1; border-radius:inherit;
+      background:radial-gradient(ellipse at center, var(--tile-glow,rgba(94,129,255,.35)) 0%, rgba(0,0,0,0) 65%);
+      filter:blur(18px); opacity:.9; pointer-events:none;
+    }
+    .tile:hover{
+      transform:translateY(-2px);
+      border-color:var(--tile-edge,rgba(94,129,255,.55));
+      box-shadow:
+        0 0 0 1px var(--tile-edge,rgba(94,129,255,.55)) inset,
+        0 0 0 1px var(--tile-edge,rgba(94,129,255,.55)),
+        0 0 60px 14px var(--tile-glow,rgba(94,129,255,.45));
+    }
+
+    /* Per-tile palettes */
+    .tile-blue{
+      --tile-bg:linear-gradient(180deg,rgba(13,21,39,.76),rgba(8,14,26,.72));
+      --tile-glow:rgba(79,127,255,.42);
+      --tile-edge:rgba(86,142,255,.62);
+    }
+    .tile-green{
+      --tile-bg:linear-gradient(180deg,rgba(13,39,29,.78),rgba(8,26,19,.70));
+      --tile-glow:rgba(34,197,94,.40);
+      --tile-edge:rgba(34,197,94,.58);
+    }
+    .tile-amber{
+      --tile-bg:linear-gradient(180deg,rgba(55,39,13,.78),rgba(31,22,7,.70));
+      --tile-glow:rgba(245,158,11,.44);
+      --tile-edge:rgba(251,191,36,.56);
+    }
+
+    /* Sub-cards / panels */
+    .panel{
+      background:linear-gradient(180deg,rgba(14,18,29,.6),rgba(12,14,22,.55));
+      border:1px solid rgba(255,255,255,.08); border-radius:1.2rem; color:#E9EDF6
+    }
+
+    /* Misc from earlier build */
+    .ringg{--p:75;position:relative}
+    .ringg:before{content:"";position:absolute;inset:-2px;border-radius:9999px;background:conic-gradient(#5E81FF calc(var(--p)*1%), #334155 0);-webkit-mask:radial-gradient(farthest-side,transparent 78%,#000 79%);mask:radial-gradient(farthest-side,transparent 78%,#000 79%)}
+    .vbtn{background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.12); color:#EAF0FF}
+    .vbtn:hover{background:rgba(255,255,255,.12)}
+    .route h1{color:#F3F6FF}
+  </style>
+</head>
+
+<body class="text-slate-200">
+  <!-- Top Bar -->
+  <header class="sticky top-0 z-50 glass-top">
+    <div class="max-w-7xl mx-auto h-14 px-4 sm:px-6 lg:px-8 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-xl bg-brand-600 text-white flex items-center justify-center shadow-soft">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/></svg>
+        </div>
+        <span class="font-semibold text-slate-100">Turbo Ops</span>
+        <span class="hidden md:inline text-xs text-slate-400 border-l pl-3">Apps Script Web App</span>
+      </div>
+      <nav class="hidden md:flex items-center gap-1">
+        <button data-route="dashboard" class="navbtn active">Dashboard</button>
+        <button data-route="dealers"   class="navbtn">Dealer Management</button>
+        <button data-route="team"      class="navbtn">Team Tracker</button>
+        <button data-route="turbo"     class="navbtn">Turbo Apply</button>
+        <button data-route="admin"     class="navbtn">Admin</button>
+      </nav>
+      <div class="w-8 h-8 rounded-full" style="background:rgba(255,255,255,.18)"></div>
+    </div>
+  </header>
+
+  <!-- Page Container -->
+  <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+    <!-- DASHBOARD -->
+    <section id="route-dashboard" class="route active">
+      <!-- Greeting -->
+      <div class="panel p-6 flex items-start justify-between">
+        <div>
+          <div class="text-sm text-slate-400">Team Lead • Online</div>
+          <h1 class="text-3xl font-semibold mt-1 gemini-grad">Good afternoon, Sarah!</h1>
+          <p class="text-slate-300 mt-1">Welcome back to your operations dashboard.</p>
+        </div>
+        <div class="flex items-center gap-3 text-sm">
+          <span class="chip"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/></svg> <span class="text-slate-200">Active Dealers</span> <strong id="dashActive">—</strong></span>
+          <span class="chip">+ <span class="text-slate-200">Pending Reviews</span> <strong>7</strong></span>
+          <span class="chip">⚡ <span class="text-slate-200">Need Attention</span> <strong>12</strong></span>
+        </div>
+      </div>
+
+      <!-- Tiles -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+        <!-- Dealer Management -->
+        <a href="#dealers" data-route="dealers"
+           class="tile tile-blue p-5 transition group">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-3">
+              <div class="w-10 h-10 rounded-xl vbtn flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 5h18M3 12h18M3 19h18"/></svg>
+              </div>
+              <h3 class="font-semibold text-white">Dealer Management</h3>
+            </div>
+            <span class="text-emerald-400 text-sm">Active</span>
+          </div>
+          <p class="text-sm text-slate-300">Manage dealer relationships, onboarding, and reporting.</p>
+          <div class="flex items-center gap-10 mt-6 text-slate-300">
+            <div><div class="text-3xl font-semibold text-white" id="kpiDlrActive">—</div><div class="opacity-80">Active Dealers</div></div>
+            <div><div class="text-3xl font-semibold text-white" id="kpiDlrPipeline">—</div><div class="opacity-80">In Pipeline</div></div>
+          </div>
+          <div class="mt-6">
+            <span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg vbtn text-sm">Access Module →</span>
+          </div>
+        </a>
+
+        <!-- Team Tracker -->
+        <a href="#team" data-route="team"
+           class="tile tile-green p-5 transition group">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-3">
+              <div class="w-10 h-10 rounded-xl vbtn flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 4h18v6H3z"/><path d="M16 20H8a2 2 0 0 1-2-2v-4h12v4a2 2 0 0 1-2 2z"/></svg>
+              </div>
+              <h3 class="font-semibold text-white">Team Tracker</h3>
+            </div>
+            <span class="text-emerald-400 text-sm">Active</span>
+          </div>
+          <p class="text-sm text-slate-300">Timesheets, approvals, and utilization analytics.</p>
+          <div class="flex items-center gap-10 mt-6 text-slate-300">
+            <div><div class="text-3xl font-semibold text-white">156</div><div class="opacity-80">Hours This Week</div></div>
+            <div><div class="text-3xl font-semibold text-white">7</div><div class="opacity-80">Pending Approvals</div></div>
+          </div>
+          <div class="mt-6">
+            <span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg vbtn text-sm">Access Module →</span>
+          </div>
+        </a>
+
+        <!-- Turbo Apply -->
+        <a href="#turbo" data-route="turbo"
+           class="tile tile-amber p-5 transition group">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-3">
+              <div class="w-10 h-10 rounded-xl vbtn flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M2 12h20"/></svg>
+              </div>
+              <h3 class="font-semibold text-white">Turbo Apply</h3>
+            </div>
+            <span class="text-emerald-400 text-sm">Active</span>
+          </div>
+          <p class="text-sm text-slate-300">AI-powered pacing with batch apply and guardrails.</p>
+          <div class="flex items-center gap-10 mt-6 text-slate-300">
+            <div><div class="text-3xl font-semibold text-white">89</div><div class="opacity-80">Campaigns</div></div>
+            <div><div class="text-3xl font-semibold text-white">12</div><div class="opacity-80">Need Attention</div></div>
+          </div>
+          <div class="mt-6">
+            <span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg vbtn text-sm">Access Module →</span>
+          </div>
+        </a>
+      </div>
+
+      <!-- System + Performance -->
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
+        <div class="panel p-6">
+          <h4 class="font-semibold text-white">System Health</h4>
+          <ul class="mt-3 space-y-2 text-sm">
+            <li class="flex items-center justify-between"><span>Google Ads API</span><span class="text-emerald-400">online</span></li>
+            <li class="flex items-center justify-between"><span>Google Sheets</span><span class="text-emerald-400">online</span></li>
+            <li class="flex items-center justify-between"><span>Authentication</span><span class="text-amber-400">warning</span></li>
+          </ul>
+        </div>
+        <div class="panel p-6">
+          <h4 class="font-semibold text-white">Performance Overview</h4>
+          <div class="mt-2 text-sm text-slate-300">(chart placeholder)</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- DEALER MANAGEMENT -->
+    <section id="route-dealers" class="route">
+      <div class="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <div class="text-sm text-slate-400"><a href="#dashboard" data-route="dashboard" class="text-blue-300 hover:underline">Dashboard</a> → Dealer Management</div>
+          <h1 class="text-2xl font-semibold">Dealer Management</h1>
+          <p class="text-slate-300">Track stages, access, and budgets across all dealers.</p>
+        </div>
+        <div class="flex gap-2">
+          <button class="px-3 py-2 rounded-lg vbtn" onclick="exportCsv()">Export</button>
+          <button class="px-3 py-2 rounded-lg vbtn opacity-60" disabled>Import</button>
+          <button id="btnAddDealer" class="px-3 py-2 rounded-lg bg-blue-600 text-white shadow-soft">+ Add New Dealer</button>
+        </div>
+      </div>
+
+      <!-- KPI cards -->
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
+        <div class="panel p-4"><div class="text-3xl font-semibold" id="kpi-total-dealers">—</div><div class="text-sm text-slate-300">Total Dealers</div></div>
+        <div class="panel p-4"><div class="text-3xl font-semibold" id="kpi-active">—</div><div class="text-sm text-slate-300">Active</div></div>
+        <div class="panel p-4"><div class="text-3xl font-semibold" id="kpi-pipeline">—</div><div class="text-sm text-slate-300">In Pipeline</div></div>
+        <div class="panel p-4"><div class="text-3xl font-semibold" id="kpi-completion">—</div><div class="text-sm text-slate-300">Avg. Completion</div></div>
+      </div>
+
+      <div class="mt-6 grid grid-cols-1 lg:grid-cols-4 gap-4">
+        <!-- Filters -->
+        <aside class="panel p-4">
+          <div class="flex items-center justify-between mb-3">
+            <h4 class="font-semibold">Filters</h4>
+            <button class="text-xs text-slate-400" onclick="resetFilters()">Reset</button>
+          </div>
+          <div class="space-y-4 text-sm">
+            <div>
+              <label class="block text-slate-400 text-xs mb-1">Search</label>
+              <input id="filter-q" type="text" class="w-full rounded-lg border border-slate-600/50 bg-black/20 px-3 py-2 text-slate-100 placeholder-slate-400" placeholder="Search dealers..." oninput="loadDealers(0)" />
+            </div>
+            <div>
+              <label class="block text-slate-400 text-xs mb-1">Stage</label>
+              <select id="filter-stage" class="w-full rounded-lg border border-slate-600/50 bg-black/20 px-3 py-2" onchange="loadDealers(0)">
+                <option value="">All</option>
+                <option>In-Discussion</option>
+                <option>Proposal</option>
+                <option>Contract</option>
+                <option>Onboarding</option>
+                <option>Live</option>
+                <option>Paused</option>
+                <option>Churned</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-slate-400 text-xs mb-1">Has Google Ads</label>
+              <select id="filter-has-sem" class="w-full rounded-lg border border-slate-600/50 bg-black/20 px-3 py-2" onchange="loadDealers(0)">
+                <option value="">All</option>
+                <option value="1">Yes</option>
+                <option value="0">No</option>
+              </select>
+            </div>
+          </div>
+        </aside>
+
+        <!-- Grid -->
+        <section class="lg:col-span-3 min-h-[200px]" id="dealer-grid"></section>
+      </div>
+
+      <!-- Floating Add -->
+      <button id="fabAdd" class="fixed bottom-6 right-6 px-4 py-3 rounded-full bg-blue-600 text-white shadow-soft hover:translate-y-[-2px] transition">+ Add Dealer</button>
+    </section>
+
+    <!-- TEAM TRACKER -->
+    <section id="route-team" class="route">
+      <h1 class="text-2xl font-semibold">Team Tracker</h1>
+      <div class="panel p-6 mt-4 text-slate-300">Shell for My Day / My Week and approvals.</div>
+    </section>
+
+    <!-- TURBO APPLY -->
+    <section id="route-turbo" class="route">
+      <h1 class="text-2xl font-semibold">Turbo Apply</h1>
+      <div class="panel p-6 mt-4 text-slate-300">Shell for Pacing + Apply drawer.</div>
+    </section>
+
+    <!-- ADMIN -->
+    <section id="route-admin" class="route">
+      <h1 class="text-2xl font-semibold">Admin</h1>
+      <div class="panel p-6 mt-4 text-slate-300">Config & Roles (coming soon).</div>
+    </section>
+  </main>
+
+  <!-- Add Dealer Modal -->
+  <div id="modal" class="fixed inset-0 hidden items-center justify-center bg-black/40 p-4">
+    <div class="w-full max-w-3xl rounded-2xl panel">
+      <div class="flex items-center justify-between p-4 border-b border-white/10">
+        <h3 class="font-semibold">Add New Dealer</h3>
+        <button onclick="closeModal()" class="p-1 rounded hover:bg-white/10">✕</button>
+      </div>
+      <form id="dealerForm" class="p-4 space-y-6" onsubmit="submitDealer(event)">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Dealer Name</label>
+            <input required name="dealer_name" class="w-full border border-slate-600/50 bg-black/20 rounded-lg px-3 py-2" />
+          </div>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Website</label>
+            <input required name="website" class="w-full border border-slate-600/50 bg-black/20 rounded-lg px-3 py-2" placeholder="https://" />
+          </div>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Stage</label>
+            <select name="stage" class="w-full border border-slate-600/50 bg-black/20 rounded-lg px-3 py-2">
+              <option>Onboarding</option>
+              <option>Live</option>
+              <option>Proposal</option>
+              <option>Contract</option>
+              <option>Paused</option>
+              <option>Churned</option>
+            </select>
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">Billing Day (1–28)</label>
+              <input type="number" min="1" max="28" name="billing_day" class="w-full border border-slate-600/50 bg-black/20 rounded-lg px-3 py-2" />
+            </div>
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">Currency</label>
+              <select name="currency" class="w-full border border-slate-600/50 bg-black/20 rounded-lg px-3 py-2"><option>USD</option><option>CAD</option></select>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Primary Contact</label>
+            <input name="primary_contact_name" class="w-full border border-slate-600/50 bg-black/20 rounded-lg px-3 py-2" />
+          </div>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Email</label>
+            <input name="primary_contact_email" class="w-full border border-slate-600/50 bg-black/20 rounded-lg px-3 py-2" />
+          </div>
+          <div>
+            <label class="block text-xs text-slate-400 mb-1">Phone</label>
+            <input name="primary_contact_phone" class="w-full border border-slate-600/50 bg-black/20 rounded-lg px-3 py-2" />
+          </div>
+        </div>
+
+        <div class="space-y-2">
+          <div class="flex items-center justify-between">
+            <label class="font-medium">Products / Services</label>
+            <button type="button" class="text-xs text-slate-400 underline" onclick="selectAllServices(true)">Select all</button>
+          </div>
+          <div id="servicesGrid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2"></div>
+        </div>
+
+        <div id="budgetsWrap" class="hidden">
+          <h4 class="font-medium mb-2">Budgets</h4>
+          <div id="budgetRows" class="space-y-2"></div>
+        </div>
+
+        <div class="flex items-center justify-end gap-2 pt-2 border-t border-white/10">
+          <button type="button" class="px-3 py-2 rounded-lg vbtn" onclick="closeModal()">Cancel</button>
+          <button class="px-3 py-2 rounded-lg bg-blue-600 text-white">Save Dealer</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="fixed bottom-6 left-1/2 -translate-x-1/2 hidden px-4 py-2 rounded-xl bg-slate-900 text-white text-sm shadow-soft">Saved</div>
+
+  <script>
+    // === PRODUCTS ===
+    const PRODUCTS = [
+      { id:'marketing_portal_advance', label:'Marketing Portal Advance', budget:false, coop:false },
+      { id:'marketing_portal_basic',   label:'Marketing Portal Basic',   budget:false, coop:false },
+      { id:'crm',                      label:'CRM',                      budget:false, coop:false },
+      { id:'turbo_lead',               label:'Turbo lead',               budget:false, coop:false },
+      { id:'seo_basic',                label:'SEO Basic',                budget:false, coop:false },
+      { id:'seo_premium',              label:'SEO Premium',              budget:false, coop:false },
+      { id:'gmb',                      label:'GMB',                      budget:false, coop:false },
+      { id:'google_reviews_setup',     label:'Google Reviews Setup',     budget:false, coop:false },
+      { id:'google_ads',               label:'Google Ads',               budget:true,  coop:true  },
+      { id:'remarketing_google',       label:'Remarketing Google Ads',   budget:true,  coop:true  },
+      { id:'remarketing_facebook',     label:'Remarketing Facebook Ads', budget:true,  coop:true  },
+      { id:'smm',                      label:'SMM',                      budget:true,  coop:true  },
+      { id:'geofencing',               label:'Geofencing',               budget:true,  coop:true  },
+      { id:'youtube_ads',              label:'YouTube Ads',              budget:true,  coop:true  },
+      { id:'social_organic',           label:'Social Media - Organic',   budget:false, coop:false }
+    ];
+
+    // === STATE ===
+    const STATE = { rows:[], total:0, page:0, limit:48 };
+
+    // ROUTING
+    document.querySelectorAll('[data-route]').forEach(el=>el.addEventListener('click',(e)=>{
+      e.preventDefault();
+      const target=el.dataset.route || (el.getAttribute('href')||'#').replace('#','');
+      if(target) location.hash=target;
+    }));
+    function setRoute(route){
+      document.querySelectorAll('.route').forEach(el=>el.classList.remove('active'));
+      const target=document.getElementById('route-'+route) || document.getElementById('route-dashboard');
+      target.classList.add('active');
+      document.querySelectorAll('.navbtn').forEach(b=>b.classList.remove('active'));
+      const nav=document.querySelector(`[data-route="${route}"]`);
+      if(nav) nav.classList.add('active');
+      if(route==='dealers') loadDealers(0);
+    }
+    function currentRoute(){
+      const r=(location.hash||'#dashboard').replace('#','');
+      return ['dashboard','dealers','team','turbo','admin'].includes(r)?r:'dashboard';
+    }
+    window.addEventListener('hashchange',()=>setRoute(currentRoute()));
+
+    // DEALERS: filters
+    function resetFilters(){
+      document.getElementById('filter-q').value='';
+      document.getElementById('filter-stage').value='';
+      document.getElementById('filter-has-sem').value='';
+      loadDealers(0);
+    }
+
+    // Load from server (Google Sheets via Apps Script)
+    function loadDealers(page=0){
+      STATE.page=page;
+      const args={
+        page, limit:STATE.limit,
+        q:document.getElementById('filter-q').value || '',
+        stage:document.getElementById('filter-stage').value || '',
+        hasSem:document.getElementById('filter-has-sem').value || ''
+      };
+      if (document.getElementById('route-dealers').classList.contains('active')) showGridSkeleton();
+      if (typeof google!=='undefined' && google.script && google.script.run){
+        google.script.run
+          .withSuccessHandler(res=>{
+            STATE.rows=res.rows||[]; STATE.total=res.total||0;
+            renderDealers(); updateDealerKPIs();
+          })
+          .withFailureHandler(err=>{ console.error(err); showToast('Load failed'); })
+          .listDealersPaged(args);
+      } else {
+        // local fallback
+        STATE.rows=[]; STATE.total=0; renderDealers();
+      }
+    }
+
+    function updateDealerKPIs(){
+      const active=STATE.rows.filter(d=>d.stage==='Live').length;
+      const pipeline=STATE.rows.filter(d=>['In-Discussion','Proposal','Contract','Onboarding'].includes(d.stage)).length;
+      document.getElementById('kpi-total-dealers').textContent=STATE.total || STATE.rows.length;
+      document.getElementById('kpi-active').textContent=active;
+      document.getElementById('kpi-pipeline').textContent=pipeline;
+      document.getElementById('kpiDlrActive').textContent=active;
+      document.getElementById('kpiDlrPipeline').textContent=pipeline;
+      document.getElementById('dashActive').textContent=active;
+    }
+
+    function showGridSkeleton(){
+      const grid=document.getElementById('dealer-grid');
+      grid.innerHTML='';
+      for(let i=0;i<6;i++){
+        const s=document.createElement('div');
+        s.className='panel p-4 animate-pulse h-36';
+        grid.appendChild(s);
+      }
+    }
+
+    function renderDealers(){
+      const grid=document.getElementById('dealer-grid');
+      grid.innerHTML='';
+      if(!STATE.rows.length){
+        grid.innerHTML='<div class="text-slate-300">No dealers found.</div>';
+        return;
+      }
+      STATE.rows.forEach(r=>{
+        const card=document.createElement('div');
+        card.className='panel p-4 flex flex-col gap-3 hover:-translate-y-0.5 transition';
+        const svcCount=(r.services||[]).length; const pct=Math.min(100,svcCount/5*100);
+        card.innerHTML=`
+          <div class="flex items-start justify-between">
+            <div>
+              <div class="text-xs text-slate-400">${r.dealer_id||''}</div>
+              <div class="font-semibold text-white">${r.dealer_name||''}</div>
+              ${r.website?`<a class="text-sm text-blue-300 hover:underline" target="_blank" href="${r.website}">${r.website}</a>`:''}
+            </div>
+            <div class="ringg w-10 h-10 rounded-full" style="--p:${pct}"></div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="px-2 py-0.5 rounded-full text-xs ${badgeClass(r.stage)}">${r.stage||''}</span>
+            ${r.sem_budget?`<span class="inline-flex items-center px-2 py-1 rounded-full text-xs bg-emerald-500/10 text-emerald-300 border border-emerald-400/30">SEM ${fmtCurrency(r.sem_budget,r.currency)}</span>`:''}
+          </div>
+          <div class="flex flex-wrap gap-1">${(r.services||[]).map(s=>`<span class="inline-flex items-center px-2 py-1 rounded-full text-xs bg-white/5 border border-white/10">${s}</span>`).join('')}</div>
+          <div class="flex items-center justify-end gap-2 pt-1">
+            <button class="px-2.5 py-1 text-sm rounded-lg vbtn">Open</button>
+            <button class="px-2.5 py-1 text-sm rounded-lg bg-blue-600 text-white">Actions</button>
+          </div>`;
+        grid.appendChild(card);
+      });
+    }
+
+    function badgeClass(stage){
+      switch(stage){
+        case 'Live': return 'bg-emerald-500/10 text-emerald-300 border border-emerald-400/30';
+        case 'Onboarding': return 'bg-amber-500/10 text-amber-300 border border-amber-400/30';
+        case 'Contract': return 'bg-indigo-500/10 text-indigo-300 border border-indigo-400/30';
+        case 'Proposal': return 'bg-sky-500/10 text-sky-300 border border-sky-400/30';
+        case 'Paused': return 'bg-rose-500/10 text-rose-300 border border-rose-400/30';
+        case 'Churned': return 'bg-white/10 text-slate-300 border border-white/20';
+        default: return 'bg-white/10 text-slate-200 border border-white/20';
+      }
+    }
+
+    function fmtCurrency(n, cur){ try{ return new Intl.NumberFormat('en-US',{style:'currency',currency:cur||'USD'}).format(Number(n)); }catch(e){ return `$${n}` } }
+
+    // MODAL
+    const modal=document.getElementById('modal');
+    document.getElementById('btnAddDealer').addEventListener('click', openModal);
+    document.getElementById('fabAdd').addEventListener('click', openModal);
+
+    function openModal(){
+      const grid=document.getElementById('servicesGrid');
+      grid.innerHTML=PRODUCTS.map(p=>`
+        <label class="flex items-center gap-2 border border-white/10 bg-white/5 rounded-lg px-3 py-2 hover:bg-white/10">
+          <input type="checkbox" name="svc_${p.id}" onchange="onServiceToggle(this, '${p.id}')">
+          <span>${p.label}${p.budget?'<span class="ml-1 text-xs text-slate-400">(budget)</span>':''}</span>
+        </label>`).join('');
+      document.getElementById('budgetRows').innerHTML='';
+      document.getElementById('budgetsWrap').classList.add('hidden');
+      modal.classList.remove('hidden'); modal.classList.add('flex');
+    }
+    function closeModal(){ modal.classList.add('hidden'); modal.classList.remove('flex'); document.getElementById('dealerForm').reset(); }
+    function selectAllServices(on){ document.querySelectorAll('#servicesGrid input[type="checkbox"]').forEach(cb=>{ cb.checked=on; cb.dispatchEvent(new Event('change')); }); }
+    function onServiceToggle(cb,id){
+      const p=PRODUCTS.find(x=>x.id===id); if(!p||!p.budget) return;
+      const wrap=document.getElementById('budgetsWrap'); wrap.classList.remove('hidden');
+      const rowId='row_budget_'+id; const exists=document.getElementById(rowId);
+      if(cb.checked && !exists){
+        const row=document.createElement('div'); row.id=rowId; row.className='border border-white/10 rounded-lg p-3 bg-white/5';
+        row.innerHTML=`
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+            <div>
+              <label class="block text-xs text-slate-400 mb-1">${p.label} Monthly Budget</label>
+              <input name="budget_${id}" type="number" min="0" class="w-full border border-slate-600/50 bg-black/20 rounded-lg px-3 py-2" placeholder="e.g., 1500" />
+            </div>
+            ${p.coop?`
+            <div class="flex items-center gap-2 mt-1 md:mt-0">
+              <input type="checkbox" name="coop_${id}" onchange="toggleCoop('${id}',this.checked)">
+              <label class="text-sm">Co-op included?</label>
+            </div>
+            <div id="coopwrap_${id}" class="hidden">
+              <label class="block text-xs text-slate-400 mb-1">Co-op Budget</label>
+              <input name="coop_budget_${id}" type="number" min="0" class="w-full border border-slate-600/50 bg-black/20 rounded-lg px-3 py-2" placeholder="e.g., 500" />
+            </div>`:'<div></div><div></div>'}
+          </div>`;
+        document.getElementById('budgetRows').appendChild(row);
+      }
+      if(!cb.checked && exists){ exists.remove(); }
+      if(document.getElementById('budgetRows').children.length===0){ document.getElementById('budgetsWrap').classList.add('hidden'); }
+    }
+    function toggleCoop(id,on){ const el=document.getElementById('coopwrap_'+id); if(el) el.classList.toggle('hidden',!on); }
+
+    function submitDealer(e){
+      e.preventDefault();
+      const f=e.target; const fd=new FormData(f); const data=Object.fromEntries(fd.entries());
+      const selected=[]; const budgets={};
+      PRODUCTS.forEach(p=>{ if(fd.get('svc_'+p.id)==='on'){ selected.push(p.label); if(p.budget){ budgets[p.id]={amount:Number(fd.get('budget_'+p.id)||0), coopIncluded:fd.get('coop_'+p.id)==='on', coopBudget:Number(fd.get('coop_budget_'+p.id)||0)} } } });
+      const dealer={ dealer_name:data.dealer_name, website:data.website, stage:data.stage, billing_day:data.billing_day?Number(data.billing_day):'', currency:data.currency||'USD', primary_contact_name:data.primary_contact_name||'', primary_contact_email:data.primary_contact_email||'', primary_contact_phone:data.primary_contact_phone||'', services:selected, budgets };
+
+      const btns=document.querySelectorAll('#dealerForm button'); btns.forEach(b=>b.disabled=true);
+      google.script.run
+        .withSuccessHandler(()=>{ btns.forEach(b=>b.disabled=false); closeModal(); showToast('Dealer saved'); loadDealers(0); })
+        .withFailureHandler(err=>{ btns.forEach(b=>b.disabled=false); alert(err.message||err); })
+        .addDealer(dealer);
+    }
+
+    // Toast
+    function showToast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.remove('hidden'); setTimeout(()=>t.classList.add('hidden'),1600); }
+
+    // Export CSV (server)
+    function exportCsv(){
+      if (typeof google!=='undefined' && google.script && google.script.run){
+        google.script.run.withSuccessHandler(csv=>{
+          const blob=new Blob([csv],{type:'text/csv'});
+          const url=URL.createObjectURL(blob);
+          const a=document.createElement('a'); a.href=url; a.download='dealers.csv'; a.click(); URL.revokeObjectURL(url);
+        }).exportDealersCsv_();
+      } else {
+        alert('Export is available in the deployed web app.');
+      }
+    }
+
+    // Init
+    document.addEventListener('DOMContentLoaded',()=>{ setRoute(currentRoute()); loadDealers(0); });
+  </script>
+</body>
+</html>
